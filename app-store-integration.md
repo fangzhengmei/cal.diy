@@ -1476,6 +1476,238 @@ private getVideoCredentialByCalendarEvent(
 | **无 credentialId** | undefined | `{id:123, type:"zoom_video"}` | 类型包含 "zoom" 的凭据 | **低** |
 | **用户未安装 Zoom** | undefined | 无类型匹配 | FAKE_DAILY_CREDENTIAL | **最低** |
 
+---
+
+### A.4.4 团队凭据选择的特殊逻辑（关键！）
+
+**⚠️ 这是团队场景中最容易出错的部分**
+
+#### A.4.4.1 凭据池的来源
+
+**代码位置**: `packages/features/bookings/lib/getAllCredentialsForUsersOnEvent/getAllCredentials.ts:22-79`
+
+```typescript
+export const getAllCredentialsIncludeServiceAccountKey = async (
+  user: { id: number; username: string | null; email: string; credentials: CredentialPayload[] },
+  eventType: EventType
+) => {
+  // ========== 步骤 1：从组织者获取个人凭据 ==========
+  let allCredentials = Array.isArray(user.credentials) ? user.credentials : [];
+
+  // ========== 步骤 2：从团队获取团队凭据 ==========
+  if (eventType?.team?.id) {
+    const teamCredentialsQuery = await prisma.credential.findMany({
+      where: {
+        teamId: eventType.team.id,  // 团队凭据的 teamId 字段有值
+      },
+      select: credentialForCalendarServiceSelect,
+    });
+    if (Array.isArray(teamCredentialsQuery)) {
+      allCredentials.push(...teamCredentialsQuery);
+    }
+  }
+
+  // ========== 步骤 3：从组织获取组织凭据 ==========
+  if (profile?.organizationId) {
+    const org = await prisma.team.findUnique({
+      where: { id: profile.organizationId },
+      select: { credentials: { select: credentialForCalendarServiceSelect } },
+    });
+    if (org?.credentials) {
+      allCredentials.push(...org.credentials);
+    }
+  }
+
+  return allCredentials;
+};
+```
+
+**凭据池构成**：
+
+| 凭据类型 | 来源 | 标识方式 | 添加顺序 |
+|----------|------|----------|----------|
+| **个人凭据** | `organizerUser.credentials` | `credential.userId` 有值 | 第 1 批 |
+| **团队凭据** | `teamId: eventType.team.id` | `credential.teamId` 有值 | 第 2 批 |
+| **组织凭据** | `organizationId` | `credential.teamId` 是组织 ID | 第 3 批 |
+
+#### A.4.4.2 凭据排序规则
+
+**代码位置**: `packages/features/bookings/lib/EventManager.ts:51-67`
+
+```typescript
+// ========== 排序函数 1：按 ID 降序（最新创建的在前） ==========
+const latestCredentialFirst = <T extends HasId>(a: T, b: T) => {
+  return b.id - a.id;  // 大的在前
+};
+
+// ========== 排序函数 2：委托凭据在前（仅日历凭据） ==========
+const delegatedCredentialFirst = <T extends { delegatedToId?: string | null }>(a: T, b: T) => {
+  return (b.delegatedToId ? 1 : 0) - (a.delegatedToId ? 1 : 0);
+};
+
+// ========== EventManager 中的实际排序 ==========
+this.videoCredentials = appCredentials
+  .filter((cred) => cred.type.endsWith("_video") || cred.type.endsWith("_conferencing"))
+  // ⚠️ 视频凭据只使用 latestCredentialFirst 排序！
+  // 这意味着：ID 最大的（最新添加的）排在最前面
+  .sort(latestCredentialFirst);
+
+// 日历凭据有额外的 delegatedCredentialFirst 排序
+this.calendarCredentials = appCredentials
+  .filter(...)
+  .sort(latestCredentialFirst)
+  // 委托凭据优先（不会过期，权限一致）
+  .sort(delegatedCredentialFirst);
+```
+
+**关键差异**：
+
+| 凭据类型 | 排序规则 | 影响 |
+|----------|----------|------|
+| **视频凭据** | 仅 `latestCredentialFirst` | 最新添加的凭据排在最前面 |
+| **日历凭据** | `delegatedCredentialFirst` + `latestCredentialFirst` | 委托凭据优先，然后按 ID 降序 |
+
+#### A.4.4.3 团队轮询场景的凭据选择问题
+
+这是团队场景中最常见的问题！
+
+```
+场景：团队轮询事件类型
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  团队：Engineering Team (id: 10)                                                          │
+│  事件类型：团队会议 (schedulingType: ROUND_ROBIN)                                        │
+│  成员：                                                                                    │
+│  ├─ Alice (id: 1) - 已安装 Zoom，credentialId: 123 (type: zoom_video)                  │
+│  ├─ Bob (id: 2) - 已安装 Zoom，credentialId: 456 (type: zoom_video)                    │
+│  └─ Charlie (id: 3) - 未安装 Zoom                                                        │
+│                                                                                             │
+│  EventType.locations = [                                                                   │
+│    { type: "integrations:zoom", credentialId: 123 }  ← Alice 设置的凭据                 │
+│  ]                                                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+                        │
+                        │ 预约发生，轮询选中 Bob 作为组织者
+                        ▼
+
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  步骤 1：获取凭据池 (getAllCredentialsIncludeServiceAccountKey)                          │
+│                                                                                             │
+│  organizerUser = Bob (id: 2)                                                              │
+│  Bob 的个人凭据 = [{ id: 456, type: "zoom_video", userId: 2 }]                           │
+│  团队凭据 = [{ id: 789, type: "zoom_video", teamId: 10 }] ← 假设团队也安装了 Zoom      │
+│                                                                                             │
+│  allCredentials = [                                                                        │
+│    { id: 456, type: "zoom_video", userId: 2 },  // Bob 的个人凭据                         │
+│    { id: 789, type: "zoom_video", teamId: 10 }, // 团队凭据                               │
+│  ]                                                                                          │
+│                                                                                             │
+│  ⚠️  注意：Alice 的凭据 (id: 123) 不在凭据池中！                                           │
+│  因为 organizerUser 是 Bob，getAllCredentials 只获取 Bob + 团队的凭据                    │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  步骤 2：凭据选择 (getVideoCredentialByCalendarEvent)                                    │
+│                                                                                             │
+│  输入：                                                                                     │
+│  ├─ event.conferenceCredentialId = 123  ← 来自 EventType.locations                       │
+│  └─ this.videoCredentials = [                                                             │
+│      { id: 456, type: "zoom_video", userId: 2 },                                         │
+│      { id: 789, type: "zoom_video", teamId: 10 },                                        │
+│    ] (已按 latestCredentialFirst 排序)                                                    │
+│                                                                                             │
+│  ========== 分支 1：精确匹配 conferenceCredentialId = 123 ==========                     │
+│                                                                                             │
+│  this.videoCredentials.find(c => c.id === 123)                                            │
+│  │                                                                                          │
+│  ├─ 检查 {id:456} → 456 === 123? ✗                                                       │
+│  ├─ 检查 {id:789} → 789 === 123? ✗                                                       │
+│  └─ 结果：undefined！（Alice 的凭据不在池中）                                               │
+│                                                                                             │
+│  ========== 分支 2：回退 - 按类型模糊匹配 ==========                                      │
+│                                                                                             │
+│  integrationName = "zoom"                                                                  │
+│  this.videoCredentials.find(c => c.type.includes("zoom"))                                 │
+│  │                                                                                          │
+│  └─ 取第一个匹配的（按 ID 降序排列后，789 > 456）                                         │
+│     → 选中 {id:789, type:"zoom_video", teamId:10}  团队凭据！                             │
+│                                                                                             │
+│  ⚠️  意外结果：原本想用 Alice 的凭据 (123)，但实际用了团队凭据 (789)！                      │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**问题总结表**：
+
+| 场景 | 预期行为 | 实际行为 | 问题级别 |
+|------|----------|----------|----------|
+| 团队轮询，Alice 设置凭据，Bob 被选中 | 使用 Alice 的凭据 (123) | 精确匹配失败，回退到模糊匹配 | **高** |
+| 团队有 Zoom 凭据，成员也有 | 使用成员凭据或按配置 | 取决于哪个 ID 更大 | **中** |
+| 成员 A 设置凭据，成员 B 被选中 | 使用 A 的凭据 | 精确匹配失败，回退 | **高** |
+
+#### A.4.4.4 团队凭据 vs 个人凭据的优先级
+
+**代码中没有显式的优先级！**
+
+```typescript
+// 凭据池按添加顺序：个人凭据 → 团队凭据 → 组织凭据
+let allCredentials = [...user.credentials];        // 个人凭据先加
+allCredentials.push(...teamCredentialsQuery);       // 然后加团队凭据
+allCredentials.push(...org.credentials);            // 最后加组织凭据
+
+// 然后排序：按 ID 降序
+allCredentials.sort(latestCredentialFirst);  // 变成：ID 大的在前
+
+// 最终顺序完全取决于 ID 大小，与凭据类型无关！
+```
+
+**示例**：
+
+| 凭据 | ID | 类型 | 创建时间 | 排序后位置 |
+|------|-----|------|----------|------------|
+| Alice 的个人凭据 | 100 | `userId:1` | 2026-01-01 | 第 3 位 |
+| Bob 的个人凭据 | 200 | `userId:2` | 2026-02-01 | 第 2 位 |
+| 团队凭据 | 300 | `teamId:10` | 2026-03-01 | **第 1 位** |
+
+**结果**：团队凭据 (ID 300) 排在最前面，模糊匹配时会优先被选中！
+
+#### A.4.4.5 HostLocation 模型：按主机存储位置设置
+
+**代码位置**: `packages/prisma/schema.prisma:100-117`
+
+```prisma
+model HostLocation {
+  id           String      @id @default(uuid())
+  userId       Int
+  eventTypeId  Int
+  host         Host        @relation(fields: [userId, eventTypeId], references: [userId, eventTypeId], onDelete: Cascade)
+  type         String
+  credentialId Int?
+  credential   Credential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+  link         String?
+  address      String?
+  phoneNumber  String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@unique([userId, eventTypeId])  // 每个用户每个事件类型唯一
+  @@index([credentialId])
+  @@index([eventTypeId])
+}
+```
+
+**设计意图**：
+- 每个主机可以在不同事件类型中有不同的位置设置
+- `credentialId` 关联到具体的凭据
+- 理论上，轮询选中不同主机时，可以使用该主机的 HostLocation 配置
+
+**但目前的问题**：
+- 当前代码没有使用 `HostLocation` 来选择凭据
+- 仍然使用 `EventType.locations` 中存储的 `credentialId`
+- 这导致轮询场景下的凭据错选问题
+
+---
+
 #### A.4.4 conferenceCredentialId 来源链路
 
 让我详细追踪 `conferenceCredentialId` 是如何从 `EventType.locations` 传递到 `CalendarEvent` 的：
