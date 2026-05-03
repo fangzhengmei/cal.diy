@@ -157,7 +157,7 @@ enum PaymentOption {
 
 ### 2.3 阶段二：支付处理 (Payment Processing)
 
-**支付方式**: Stripe (为主，也支持 PayPal 等)
+**支付方式**: Stripe (为主，也支持 PayPal、BTCPayServer、HitPay、Alby 等)
 
 #### 流程步骤：
 
@@ -165,19 +165,175 @@ enum PaymentOption {
    - 文件: `packages/platform/atoms/event-types/payments/StripePaymentForm.tsx`
    - 用户输入支付信息
 
-2. **Stripe 支付流程**
-   - 创建 Checkout Session 或直接使用 PaymentIntent
+2. **支付网关流程**
+   - 创建 Checkout Session 或 PaymentIntent
    - 用户完成支付
 
-3. **支付回调处理**
-   
-   **注意**: 社区版 Webhook 不可用
-   ```typescript
-   // apps/web/pages/api/integrations/stripepayment/webhook.ts
-   export default function handler(_req: NextApiRequest, res: NextApiResponse) {
-     res.status(404).json({ message: "Payment webhooks are not available in community edition" });
-   }
-   ```
+3. **支付成功的感知机制** (关键补充)
+
+系统通过 **Webhook 回调** 感知支付成功，这是支付状态与预订状态联动的**触发入口**。
+
+#### Webhook 架构概览
+
+```
+┌─────────────────┐     POST Webhook      ┌─────────────────┐
+│  支付网关        │──────────────────────▶│  Cal.diy Webhook │
+│  (Stripe/PayPal)│                        │    端点          │
+└─────────────────┘                        └────────┬────────┘
+                                                      │
+                        验证签名 + 查询支付记录        │
+                                                      ▼
+                                             ┌─────────────────┐
+                                             │ handlePayment-  │
+                                             │    Success      │
+                                             │  (核心联动逻辑)  │
+                                             └─────────────────┘
+```
+
+#### 各支付网关 Webhook 实现
+
+| 支付网关 | Webhook 文件路径 | 触发事件 |
+|---------|------------------|---------|
+| PayPal | `packages/app-store/paypal/api/webhook.ts` | `CHECKOUT.ORDER.APPROVED` |
+| BTCPayServer | `packages/app-store/btcpayserver/api/webhook.ts` | `InvoiceSettled`, `InvoiceProcessing` |
+| HitPay | `packages/app-store/hitpay/api/webhook.ts` | `status: "completed"` |
+| Alby | `packages/app-store/alby/api/webhook.ts` | Invoice 支付完成 |
+| Stripe (社区版) | `apps/web/pages/api/integrations/stripepayment/webhook.ts` | **不可用** (返回 404) |
+
+#### Webhook 处理流程详解 (以 PayPal 为例)
+
+**文件**: `packages/app-store/paypal/api/webhook.ts`
+
+```typescript
+// 1. 接收支付网关的 POST 请求
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // 2. 解析请求体和验证签名
+  const bodyRaw = await getRawBody(req);
+  const parse = eventSchema.safeParse(JSON.parse(bodyAsString));
+
+  // 3. 检查事件类型
+  if (parsedPayload.event_type === "CHECKOUT.ORDER.APPROVED") {
+    return await handlePaypalPaymentSuccess(...);
+  }
+}
+
+// 4. 支付成功处理函数
+async function handlePaypalPaymentSuccess(payload, rawPayload, webhookHeaders) {
+  // 4.1 通过 externalId 查找本地 Payment 记录
+  const payment = await prisma.payment.findFirst({
+    where: { externalId: payload?.resource?.id },
+    select: { id: true, bookingId: true },
+  });
+
+  // 4.2 验证 webhook 签名
+  await paypalClient.verifyWebhook({ ... });
+
+  // 4.3 调用核心联动函数
+  const traceContext = distributedTracing.createTrace("paypal_webhook", {
+    meta: { paymentId: payment.id, bookingId: payment.bookingId },
+  });
+  return await handlePaymentSuccess({
+    paymentId: payment.id,
+    bookingId: payment.bookingId,
+    appSlug: appConfig.slug,
+    traceContext,
+  });
+}
+```
+
+#### Webhook 安全验证
+
+所有 webhook 处理器都包含**签名验证**，防止伪造请求：
+
+**BTCPayServer 签名验证** (`packages/app-store/btcpayserver/api/webhook.ts:18-27`):
+```typescript
+function verifyBTCPaySignature(rawBody: Buffer, expectedSignature: string, webhookSecret: string): string {
+  const hmac = crypto.createHmac("sha256", webhookSecret);
+  hmac.update(rawBody);
+  const computedSignature = hmac.digest("hex");
+  // 定时安全比较
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(computedSignature, "hex"),
+    Buffer.from(expectedSignature, "hex")
+  );
+  return computedSignature;
+}
+```
+
+**HitPay 签名验证** (`packages/app-store/hitpay/api/webhook.ts:34-45`):
+```typescript
+function generateSignatureArray<T>(secret: string, vals: T) {
+  const source: string[] = [];
+  Object.keys(vals as { [K: string]: string })
+    .sort()  // 按 key 排序
+    .forEach((key) => {
+      source.push(`${key}${(vals as { [K: string]: string })[key]}`);
+    });
+  const payload = source.join("");
+  const hmac = createHmac("sha256", secret);
+  return hmac.update(payload, "utf-8").digest("hex");
+}
+```
+
+#### 支付成功感知的完整链路
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    支付成功感知完整链路                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 用户完成支付                                                  │
+│     ┌──────────┐      ┌──────────────┐                        │
+│     │  用户    │─────▶│  支付网关     │                        │
+│     │ (浏览器)  │      │ (Stripe等)   │                        │
+│     └──────────┘      └──────────────┘                        │
+│                              │                                  │
+│                              ▼                                  │
+│  2. 支付网关发送 Webhook 回调                                    │
+│     ┌──────────────┐      ┌──────────────────┐                  │
+│     │  支付网关     │─────▶│  Cal.diy Webhook │                  │
+│     │ (Stripe等)   │ POST │    端点           │                  │
+│     └──────────────┘      └──────────────────┘                  │
+│                              │                                  │
+│                              ▼                                  │
+│  3. Webhook 处理器验证和处理                                    │
+│     ┌─────────────────────────────────────────┐                │
+│     │  a. 验证签名 (防止伪造请求)               │                │
+│     │  b. 通过 externalId 查找 Payment 记录    │                │
+│     │  c. 检查 payment.success 是否已处理      │                │
+│     └─────────────────────────────────────────┘                │
+│                              │                                  │
+│                              ▼                                  │
+│  4. 触发核心联动逻辑                                            │
+│     ┌─────────────────────────────────────────┐                │
+│     │         handlePaymentSuccess()          │                │
+│     │  ┌─────────────────────────────────┐    │                │
+│     │  │ - 取消等待支付邮件任务           │    │                │
+│     │  │ - 更新 payment.success = true  │    │                │
+│     │  │ - 更新 booking.paid = true     │    │                │
+│     │  │ - 根据 requiresConfirmation     │    │                │
+│     │  │   决定是否更新 booking.status   │    │                │
+│     │  │ - 触发 BOOKING_PAID webhook    │    │                │
+│     │  └─────────────────────────────────┘    │                │
+│     └─────────────────────────────────────────┘                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 重要说明：Stripe 社区版限制
+
+**文件**: `apps/web/pages/api/integrations/stripepayment/webhook.ts`
+
+```typescript
+export default function handler(_req: NextApiRequest, res: NextApiResponse) {
+  res.status(404).json({ message: "Payment webhooks are not available in community edition" });
+}
+```
+
+社区版中 Stripe webhook 不可用，意味着：
+- 支付成功后系统**无法自动感知**
+- 需要通过**其他机制**（如前端主动回调、轮询等）来触发状态更新
+- 企业版/专业版可能有完整的 webhook 支持
 
 ---
 
