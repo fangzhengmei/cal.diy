@@ -646,51 +646,365 @@ export const getPublicEventSelect = (fetchAllUsers: boolean) => {
 
 ## 5. 预约权限管理架构
 
-### 5.1 现状：分散式权限管理
+### 5.1 核心统一服务：BookingAccessService
 
-Cal.diy 的预约权限管理**分散在多个层次和多个模块**中，没有统一的权限判断服务。
+Cal.diy **存在统一的预订访问控制服务** `BookingAccessService`，用于判断用户是否有权访问特定预订。
 
-#### 权限管理分布概览
+#### 核心服务定义
+
+**位置**：`packages/features/bookings/services/BookingAccessService.ts`
+
+```typescript
+export class BookingAccessService {
+  /**
+   * Determines if a user has access to a booking based on:
+   * 1. Being the booking organizer
+   * 2. Being one of the hosts in a multi-host booking
+   * 3. Being a team/org admin where the event type belongs (uses PBAC if enabled)
+   * 4. Being an org admin where the booking organizer belongs (uses PBAC if enabled, for personal bookings)
+   * 5. Being a team admin of any team the booking organizer belongs to (uses PBAC if enabled, for personal bookings)
+   */
+  async doesUserIdHaveAccessToBooking({
+    userId,
+    bookingUid,
+    bookingId,
+  }: {
+    userId: number;
+    bookingUid?: string;
+    bookingId?: number;
+  }): Promise<boolean> {
+    // Case 1: User is the booking organizer
+    if (userId === booking.userId) return true;
+
+    // Case 2: User is one of the hosts
+    if (this.isUserAHost(userId, booking)) return true;
+
+    // Case 3: If booking has a teamId, check if user has access to team bookings
+    if (booking.eventType?.teamId) {
+      const hasAccess = await this.permissionCheckService.checkPermission({
+        userId,
+        teamId: booking.eventType.teamId,
+        permission: "booking.readTeamBookings",
+        fallbackRoles: [MembershipRole.OWNER, MembershipRole.ADMIN],
+      });
+      return hasAccess;
+    }
+
+    // Case 4: Check if user is admin of booking organizer's organization
+    if (bookingOwner.organizationId) {
+      const hasAccess = await this.permissionCheckService.checkPermission({
+        userId,
+        teamId: bookingOwner.organizationId,
+        permission: "booking.readOrgBookings",
+        fallbackRoles: [MembershipRole.OWNER, MembershipRole.ADMIN],
+      });
+      if (hasAccess) return true;
+    }
+
+    // Case 5: Check if user is admin of any team the booking organizer belongs to
+    for (const membership of bookingOwner.teams) {
+      const hasAccess = await this.permissionCheckService.checkPermission({
+        userId,
+        teamId: membership.teamId,
+        permission: "booking.readTeamBookings",
+        fallbackRoles: [MembershipRole.OWNER, MembershipRole.ADMIN],
+      });
+      if (hasAccess) return true;
+    }
+
+    return false;
+  }
+
+  private isUserAHost(userId: number, booking: BookingForAccessCheck): boolean {
+    // 检查用户是否是事件类型的主持人或在用户列表中
+    // 同时验证用户邮箱是否在参与者列表中（或用户是预订组织者）
+  }
+}
+```
+
+#### 权限判断流程图
+
+```
+用户请求访问预订
+        │
+        ▼
+┌───────┴───────┐
+│ 是预订组织者？ │──是──► 允许访问
+│ (userId 匹配) │
+└───────┬───────┘
+        │否
+        ▼
+┌───────┴───────┐
+│ 是主持人之一？ │──是──► 允许访问
+│ (hosts/users) │
+└───────┬───────┘
+        │否
+        ▼
+┌───────┴───────┐
+│ 事件类型有    │──是──► 检查 booking.readTeamBookings 权限
+│ teamId?       │        或角色是 OWNER/ADMIN
+└───────┬───────┘
+        │否
+        ▼
+┌───────┴───────┐
+│ 预订组织者有  │──是──► 检查 booking.readOrgBookings 权限
+│ organization? │
+└───────┬───────┘
+        │否
+        ▼
+┌───────┴───────┐
+│ 是预订组织者  │──是──► 检查 booking.readTeamBookings 权限
+│ 所属任何团队  │        (遍历所有团队)
+│ 的管理员？    │
+└───────┬───────┘
+        │否
+        ▼
+    拒绝访问
+```
+
+### 5.2 BookingAccessService 的使用场景
+
+#### 统一服务被多处使用
+
+| 使用场景 | 代码位置 | 调用方式 |
+|---------|---------|---------|
+| **API v2 守卫层** | `apps/api/v2/src/platform/bookings/2024-08-13/guards/booking-pbac.guard.ts` | `BookingPbacGuard` 拦截器 |
+| **tRPC 确认预订** | `packages/trpc/server/routers/viewer/bookings/confirm.handler.ts` | 确认前验证权限 |
+| **tRPC 报告预订** | `packages/trpc/server/routers/viewer/bookings/reportBooking.handler.ts` | 报告前验证权限 |
+| **tRPC 错误分配报告** | `packages/trpc/server/routers/viewer/bookings/hasWrongAssignmentReport.handler.ts` | 访问前验证 |
+| **预订详情服务** | `packages/features/bookings/services/BookingDetailsService.ts` | `getBookingDetails()` 内部调用 |
+| **platform-libraries 导出** | `packages/platform/libraries/index.ts:99` | 供 API v2 跨包使用 |
+
+#### API v2 守卫层使用示例
+
+**位置**：`apps/api/v2/src/platform/bookings/2024-08-13/guards/booking-pbac.guard.ts:25-58`
+
+```typescript
+@Injectable()
+export class BookingPbacGuard implements CanActivate {
+  private bookingAccessService: BookingAccessService;
+
+  constructor(private readonly prismaReadService: PrismaReadService) {
+    this.bookingAccessService = new BookingAccessService(
+      this.prismaReadService.prisma
+    );
+  }
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const user = request.user;
+    const bookingUid = request.params.bookingUid;
+
+    const hasAccess =
+      await this.bookingAccessService.doesUserIdHaveAccessToBooking({
+        userId: user.id,
+        bookingUid,
+      });
+
+    if (!hasAccess) {
+      throw new ForbiddenException(
+        `BookingPbacGuard - user with id=${user.id} does not have access to booking with uid=${bookingUid}`
+      );
+    }
+
+    request.pbacAuthorizedRequest = true;
+    return true;
+  }
+}
+```
+
+#### BookingDetailsService 使用示例
+
+**位置**：`packages/features/bookings/services/BookingDetailsService.ts:15-47`
+
+```typescript
+export class BookingDetailsService {
+  private bookingRepo: BookingRepository;
+  private bookingAccessService: BookingAccessService;
+
+  constructor(prismaClient: PrismaClient) {
+    this.bookingRepo = new BookingRepository(prismaClient);
+    this.bookingAccessService = new BookingAccessService(prismaClient);
+  }
+
+  async getBookingDetails({ userId, bookingUid }: { userId: number; bookingUid: string }) {
+    // 先使用统一服务验证权限
+    const hasAccess = await this.bookingAccessService.doesUserIdHaveAccessToBooking({
+      userId,
+      bookingUid,
+    });
+
+    if (!hasAccess) {
+      throw ErrorWithCode.Factory.Forbidden("You do not have permission to view this booking");
+    }
+
+    // 权限验证通过后才查询详细数据
+    const booking = await this.bookingRepo.findByUidForDetails({ bookingUid });
+    // ...
+  }
+}
+```
+
+### 5.3 权限管理分布概览
+
+虽然存在统一的 `BookingAccessService`，但不同场景使用不同的权限判断方式：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      权限管理分布架构                             │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  ┌──────────────┐    ┌──────────────┐                          │
-│  │  tRPC 路由层  │    │  API v2 层   │                          │
-│  │ (Web 应用)   │    │ (平台 API)   │                          │
-│  └──────┬───────┘    └──────┬───────┘                          │
-│         │                    │                                   │
-│         ▼                    ▼                                   │
-│  ┌──────────────────────────────────────┐                      │
-│  │         守卫层 (Guards)               │                      │
-│  │  - EventTypeOwnershipGuard            │                      │
-│  │  - IsUserEventTypeWebhookGuard        │                      │
-│  │  - BookingUidGuard                    │                      │
-│  │  - BookingPbacGuard                   │                      │
-│  └──────────────┬───────────────────────┘                      │
-│                 │                                                │
-│                 ▼                                                │
-│  ┌──────────────────────────────────────┐                      │
-│  │         服务层 (Services)             │                      │
-│  │  - EventTypeAccessService             │                      │
-│  │  - EventTypeService (v1/v2)           │                      │
-│  │  - RegularBookingService               │                      │
-│  │  - HashedLinkService                   │                      │
-│  └──────────────┬───────────────────────┘                      │
-│                 │                                                │
-│                 ▼                                                │
-│  ┌──────────────────────────────────────┐                      │
-│  │        存储层 (Repositories)          │                      │
-│  │  - EventTypeRepository                 │                      │
-│  │  - BookingRepository                   │                      │
-│  │  - HashedLinkRepository                │                      │
-│  │  (查询时带权限过滤条件)                 │                      │
-│  └──────────────────────────────────────┘                      │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │              统一权限服务层 (BookingAccessService)          ││
+│  │  ┌─────────────────────────────────────────────────────┐   ││
+│  │  │ doesUserIdHaveAccessToBooking()                      │   ││
+│  │  │  - Case 1: 预订组织者                                 │   ││
+│  │  │  - Case 2: 主持人/被分配用户                          │   ││
+│  │  │  - Case 3: 团队管理员 (booking.readTeamBookings)     │   ││
+│  │  │  - Case 4: 组织管理员 (booking.readOrgBookings)       │   ││
+│  │  │  - Case 5: 预订组织者所属任何团队的管理员              │   ││
+│  │  └─────────────────────────────────────────────────────┘   ││
+│  └────────────────────────────────────────────────────────────┘│
+│                              │                                  │
+│          ┌───────────────────┼───────────────────┐           │
+│          ▼                   ▼                   ▼           │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │  tRPC 路由层  │    │  API v2 层   │    │  服务层      │  │
+│  │ (Web 应用)   │    │ (平台 API)   │    │ (业务逻辑)   │  │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
+│         │                    │                    │          │
+│         ├────────────────────┼────────────────────┤          │
+│         ▼                    ▼                    ▼          │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │                   非统一权限场景                          │ │
+│  │                                                          │ │
+│  │  1. 预订列表查询 (UNION SQL)                             │ │
+│  │     - get.handler.ts / getAllUserBookings.ts            │ │
+│  │     - 使用复杂的 SQL UNION 直接过滤                      │ │
+│  │                                                          │ │
+│  │  2. 预订创建时的权限判断                                  │ │
+│  │     - RegularBookingService                              │ │
+│  │     - 检查事件类型可见性、配额限制等                      │ │
+│  │                                                          │ │
+│  │  3. 改期/取消操作的权限判断                              │ │
+│  │     - 检查当前 EventType 的 disableRescheduling 等      │ │
+│  │     - determineReschedulePreventionRedirect()            │ │
+│  │                                                          │ │
+│  │  4. 公共页面访问权限                                      │ │
+│  │     - getEventTypesPublic() 过滤 hidden                  │ │
+│  │     - HashedLinkService 验证私有链接                     │ │
+│  └─────────────────────────────────────────────────────────┘ │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### 5.4 各层次权限逻辑详解
+
+#### 1. 使用 BookingAccessService 的场景
+
+| 场景 | 代码位置 | 权限判断方式 |
+|------|---------|-------------|
+| 确认预订 | `confirm.handler.ts:166-169` | `doesUserIdHaveAccessToBooking(bookingId)` |
+| 报告预订 | `reportBooking.handler.ts:21-24` | `doesUserIdHaveAccessToBooking(bookingUid)` |
+| 错误分配报告 | `hasWrongAssignmentReport.handler.ts:21-24` | `doesUserIdHaveAccessToBooking(bookingUid)` |
+| 获取预订详情 | `BookingDetailsService.ts:16-23` | `doesUserIdHaveAccessToBooking(bookingUid)` |
+| API v2 预订操作 | `BookingPbacGuard.ts:44-48` | 守卫层拦截，统一验证 |
+
+#### 2. 不使用 BookingAccessService 的场景
+
+##### 场景 A：预订列表查询
+
+**位置**：`packages/trpc/server/routers/viewer/bookings/get.handler.ts`
+
+使用复杂的 SQL UNION 查询直接过滤，而不是通过统一服务：
+
+```typescript
+// 预订列表查询使用 7 种 UNION 条件
+bookingQueries.push({
+  query: kysely
+    .selectFrom("Booking")
+    .where("Booking.userId", "=", user.id),  // 条件 1: 组织者
+  tables: ["Booking"],
+});
+
+bookingQueries.push({
+  query: kysely
+    .selectFrom("Booking")
+    .innerJoin("Attendee", "Attendee.bookingId", "Booking.id")
+    .where("Attendee.email", "=", user.email),  // 条件 2: 参与者
+  tables: ["Booking", "Attendee"],
+});
+
+// ... 条件 3-7: 团队/组织管理员的扩展权限
+```
+
+**原因**：列表查询需要高性能，使用 SQL 直接过滤比逐行调用服务更高效。
+
+##### 场景 B：预订创建时的权限判断
+
+**位置**：`packages/features/bookings/lib/service/RegularBookingService.ts`
+
+预订创建时的权限检查与访问权限不同：
+
+```typescript
+// 创建预订的流程中涉及的检查点：
+// 1. checkIfBookerEmailIsBlocked() - 检查邮箱是否被拉黑
+// 2. checkActiveBookingsLimitForBooker() - 检查活跃预订限制
+// 3. validateBookingTimeIsNotOutOfBounds() - 验证时间有效性
+// 4. getEventType() - 获取并验证事件类型（可见性）
+// 5. ensureAvailableUsers() - 确保用户可用
+```
+
+**原因**：创建预订是访客发起的操作，不需要"访问已有预订"的权限，而是检查事件类型的可见性和预订配额。
+
+##### 场景 C：改期/取消操作的权限判断
+
+**位置**：`apps/web/lib/reschedule/[uid]/getServerSideProps.ts`
+
+改期权限检查的是**当前 EventType 的设置**，而非用户是否有权访问预订：
+
+```typescript
+const reschedulePreventionRedirectUrl = determineReschedulePreventionRedirect({
+  booking: {
+    // ...
+    eventType: {
+      disableRescheduling: !!eventType?.disableRescheduling,
+      allowReschedulingPastBookings: eventType.allowReschedulingPastBookings,
+      minimumRescheduleNotice: eventType.minimumRescheduleNotice,
+      // ...
+    },
+  },
+  // ...
+});
+```
+
+**原因**：改期/取消权限是"操作权限"，不同于"访问权限"。用户可能有权访问预订，但无权改期（如果 EventType 设置了 `disableRescheduling: true`）。
+
+### 5.5 权限管理架构总结
+
+#### 统一与分散并存
+
+| 维度 | 统一服务 | 分散实现 |
+|------|---------|---------|
+| **预订访问权限** | ✅ `BookingAccessService.doesUserIdHaveAccessToBooking()` | - |
+| **预订列表查询** | ❌ | ✅ SQL UNION 直接过滤（性能原因） |
+| **预订创建权限** | ❌ | ✅ 独立逻辑（可见性、配额检查） |
+| **改期/取消权限** | ❌ | ✅ 独立逻辑（操作权限 vs 访问权限） |
+| **事件类型管理权限** | ❌ | ✅ `EventTypeAccessService`（独立服务） |
+
+#### 设计考量
+
+1. **分层权限模型**：
+   - **访问权限**（能看吗？）→ 统一服务 `BookingAccessService`
+   - **操作权限**（能改吗？）→ 分散检查（`disableRescheduling` 等）
+   - **列表权限**（能看哪些？）→ SQL 直接过滤（性能优先）
+
+2. **双 API 架构共享同一服务**：
+   - tRPC 和 API v2 都使用相同的 `BookingAccessService`
+   - 通过 `platform-libraries` 实现跨包共享
+
+3. **性能与一致性的权衡**：
+   - 单条预订访问 → 使用统一服务（一致性优先）
+   - 列表查询 → SQL 直接过滤（性能优先）
 
 ### 5.2 各层次权限逻辑详解
 
