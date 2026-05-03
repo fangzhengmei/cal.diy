@@ -1264,17 +1264,19 @@ frequency = 45 分钟
 
 ### 5.8 外出标记的特殊处理
 
-**关键发现**：OOO（外出）有两种处理方式：
+**关键发现**：OOO（外出）的处理方式取决于事件类型（单用户 vs 团队）：
 
-1. **在 `buildDateRanges` 中**：
-   - `oooExcludedDateRanges` 包含 OOO，但 OOO 范围是 `{ start: date, end: date }`
-   - 过滤时会被移除（因为 start === end）
-   - 所以 **OOO 不影响可用范围的生成**
+#### 1. 单用户事件
 
-2. **在 `getSlots` 中**：
-   - 通过 `datesOutOfOffice` 参数传递
-   - 检查槽位日期是否在 OOO 中
-   - 标记为 `away: true`
+在单用户事件中，OOO 只影响 UI 层：
+
+- **`buildDateRanges` 返回值**：
+  - `dateRanges`：不包含 OOO，可用范围不受影响
+  - `oooExcludedDateRanges`：包含 OOO，但单用户事件不使用这个
+- **`getSlots` 中标记**：
+  - 通过 `datesOutOfOffice` 参数传递
+  - 检查槽位日期是否在 OOO 中
+  - 标记为 `away: true`
 
 ```typescript
 // packages/features/schedules/lib/slots.ts:187-222
@@ -1295,12 +1297,96 @@ if (dateOutOfOfficeExists) {
 }
 ```
 
-**判定依据**：
-- OOO 槽位**仍然显示**，但标记为 `away: true`
-- 前端可以选择：
-  - 显示为"不可用"或"外出"状态
-  - 或者完全过滤掉
-- 这是一个**UI层决策**，而非引擎层决策
+#### 2. 团队事件（COLLECTIVE / ROUND_ROBIN / 多用户）
+
+**重要修正**：在团队事件中，OOO 会**直接影响可用范围的生成**！
+
+从 `buildDateRanges` 可以看到：
+
+```typescript
+// packages/features/schedules/lib/date-ranges.ts:312-328
+const dateRanges = Object.values({
+  ...groupedWorkingHours,
+  ...groupedDateOverrides,
+}).map(
+  (ranges) => ranges.filter((range) => range.start.valueOf() !== range.end.valueOf())
+);
+
+const oooExcludedDateRanges = Object.values({
+  ...groupedWorkingHours,
+  ...groupedDateOverrides,
+  ...groupedOOO,  // 关键：这里加入了 OOO！
+}).map(
+  (ranges) => ranges.filter((range) => range.start.valueOf() !== range.end.valueOf())
+);
+```
+
+然后在 `getAggregatedAvailability` 中：
+
+```typescript
+// packages/features/availability/lib/getAggregatedAvailability/getAggregatedAvailability.ts:25-44
+const isTeamEvent =
+  schedulingType === SchedulingType.COLLECTIVE ||
+  schedulingType === SchedulingType.ROUND_ROBIN ||
+  userAvailability.length > 1;
+
+const fixedDateRanges = mergeOverlappingDateRanges(
+  intersect(fixedHosts.map((s) => (!isTeamEvent ? s.dateRanges : s.oooExcludedDateRanges)))
+);
+```
+
+**测试用例验证**（`date-ranges.test.ts:548-582`）：
+
+```typescript
+const outOfOffice = {
+  "2023-06-13": {
+    fromUser: { id: 1, displayName: "Team Free Example" },
+  },
+};
+
+const { dateRanges, oooExcludedDateRanges } = buildDateRanges({...});
+
+// dateRanges 包含 6月13日和6月14日（OOO 不影响）
+expect(dateRanges[0]).toEqual({
+  start: dayjs.utc("2023-06-13T14:00:00Z").tz(timeZone),
+  end: dayjs.utc("2023-06-13T19:00:00Z").tz(timeZone),
+});
+expect(dateRanges[1]).toEqual({
+  start: dayjs.utc("2023-06-14T12:00:00Z").tz(timeZone),
+  end: dayjs.utc("2023-06-14T21:00:00Z").tz(timeZone),
+});
+
+// oooExcludedDateRanges 只包含 6月14日（6月13日被 OOO 排除了！）
+expect(oooExcludedDateRanges.length).toBe(1);
+expect(oooExcludedDateRanges[0]).toEqual({
+  start: dayjs("2023-06-14T12:00:00Z").tz(timeZone),
+  end: dayjs("2023-06-14T21:00:00Z").tz(timeZone),
+});
+```
+
+#### 判定依据总结
+
+| 事件类型 | 使用的范围 | OOO 影响 |
+|----------|------------|----------|
+| **单用户事件** | `dateRanges` | 只在 `getSlots` 中标记 `away: true`，不影响可用范围 |
+| **团队事件**（COLLECTIVE/ROUND_ROBIN/多用户） | `oooExcludedDateRanges` | **直接影响可用范围**，OOO 日期的可用范围被完全移除 |
+
+**为什么 OOO 在团队事件中会排除可用范围？**
+
+因为 OOO 在 `buildDateRanges` 中被处理为 `{ start: date, end: date }`（空范围），然后通过对象展开覆盖机制：
+
+```typescript
+const oooExcludedDateRanges = Object.values({
+  ...groupedWorkingHours,    // 先展开工作时间
+  ...groupedDateOverrides,    // 然后是日期覆盖
+  ...groupedOOO,               // 最后是 OOO（覆盖同日期的所有内容）
+}).map(
+  // 过滤掉空范围
+  (ranges) => ranges.filter((range) => range.start.valueOf() !== range.end.valueOf())
+);
+```
+
+由于 OOO 的范围是 `{ start: date, end: date }`（start === end），在过滤阶段会被移除，所以该日期的可用范围变为空数组。
 
 ---
 
