@@ -1574,45 +1574,78 @@ model Booking {
 - 数据冗余
 - 需要迁移现有数据
 
-#### 方案 2：统一权限判断服务
+#### 方案 2：扩展现有统一服务（现状说明 + 待改进）
 
-抽取 `BookingAccessService`，统一所有预订相关的权限判断：
+**现状**：`BookingAccessService` 已经存在，用于统一的**访问权限**判断。
+
+**已实现的能力**（`packages/features/bookings/services/BookingAccessService.ts`）：
 
 ```typescript
-class BookingAccessService {
-  // 统一判断用户是否有权访问预订
-  async canAccessBooking(booking: Booking, userId: number): Promise<boolean> {
-    // 优先级：
+export class BookingAccessService {
+  // 已实现：统一判断用户是否有权访问预订
+  async doesUserIdHaveAccessToBooking({
+    userId,
+    bookingUid,
+    bookingId,
+  }: {
+    userId: number;
+    bookingUid?: string;
+    bookingId?: number;
+  }): Promise<boolean> {
+    // 5 个判断维度：
     // 1. 用户是预订的组织者（booking.userId）
-    if (booking.userId === userId) return true;
-    
-    // 2. 用户是预订的参与者（attendee）
-    if (await this.isAttendee(booking.id, userId)) return true;
-    
-    // 3. 用户是当前事件类型的管理员
-    if (booking.eventTypeId) {
-      const canAccessEventType = await this.eventTypeAccessService
-        .userIsEventTypeAdminOrOwner(user, eventType);
-      if (canAccessEventType) return true;
-    }
-    
-    return false;
-  }
-
-  // 统一判断是否允许改期
-  async canReschedule(booking: Booking): Promise<boolean> {
-    // 策略选择：
-    // - 使用当前 EventType 设置？
-    // - 使用创建时的快照？
-    // - 混合策略？
+    // 2. 用户是主持人之一（eventType.hosts/users）
+    // 3. 用户是团队管理员（booking.readTeamBookings 权限）
+    // 4. 用户是组织管理员（booking.readOrgBookings 权限）
+    // 5. 用户是预订组织者所属任何团队的管理员
   }
 }
 ```
 
-**优点**：
-- 逻辑集中，易于维护
-- 行为一致，避免分散实现的差异
-- 便于审计和测试
+**待改进的问题**：
+
+| 问题 | 现状 | 改进方向 |
+|------|------|---------|
+| **操作权限与访问权限分离** | 改期/取消权限有独立逻辑，未集成到 `BookingAccessService` | 在 `BookingAccessService` 中增加 `canReschedule()`、`canCancel()` 方法 |
+| **列表查询不使用统一服务** | 预订列表使用 SQL UNION 直接过滤，逻辑分散 | 考虑抽取查询条件构建逻辑，与 `BookingAccessService` 的判断逻辑保持一致 |
+| **权限判断逻辑重复** | `BookingRepository.findBookingByUidAndUserId()` 有自己的 OR 条件，与 `BookingAccessService` 逻辑可能不一致 | 统一使用 `BookingAccessService` 或确保 Repository 层的查询条件与 Service 层逻辑完全一致 |
+
+**建议的扩展方案**：
+
+```typescript
+// 在现有 BookingAccessService 中扩展
+export class BookingAccessService {
+  // 已存在：访问权限判断
+  async doesUserIdHaveAccessToBooking(...): Promise<boolean> { /* ... */ }
+
+  // 新增：改期权限判断
+  async canReschedule(booking: Booking, userId: number): Promise<{
+    allowed: boolean;
+    reason?: 'DISABLED_BY_EVENT_TYPE' | 'MINIMUM_NOTICE_NOT_MET' | 'NO_ACCESS' | 'BOOKING_PAST';
+  }> {
+    // 1. 先检查访问权限
+    const hasAccess = await this.doesUserIdHaveAccessToBooking({ userId, bookingId: booking.id });
+    if (!hasAccess) return { allowed: false, reason: 'NO_ACCESS' };
+
+    // 2. 检查改期是否被禁用（使用当前 EventType 设置？还是创建时快照？）
+    // 这里需要明确业务策略
+  }
+
+  // 新增：取消权限判断
+  async canCancel(booking: Booking, userId: number): Promise<{
+    allowed: boolean;
+    reason?: 'DISABLED_BY_EVENT_TYPE' | 'NO_ACCESS' | 'BOOKING_PAST';
+  }> {
+    // 类似逻辑
+  }
+
+  // 新增：列表查询条件构建（供 SQL 查询使用，确保逻辑一致）
+  buildBookingListWhereClause(userId: number): Prisma.BookingWhereInput {
+    // 返回与 doesUserIdHaveAccessToBooking 逻辑一致的查询条件
+    // 供 get.handler.ts 的 UNION 查询使用
+  }
+}
+```
 
 #### 方案 3：显式的权限变更通知机制
 
@@ -1750,27 +1783,45 @@ model EventType {
 
 3. **服务端唯一可信源**：所有权限判断在服务端完成，前端只展示服务端返回的数据。无权限时服务端直接返回 404。
 
-4. **分散式权限管理**：权限逻辑分散在 Guard、Service、Repository 多层，以及 tRPC 和 API v2 两套系统中。
+4. **存在统一的预订访问服务**：
+   - **`BookingAccessService.doesUserIdHaveAccessToBooking()`** 是统一的预订访问权限判断服务
+   - 被 tRPC 和 API v2 两套系统共同使用
+   - 通过 `platform-libraries` 实现跨包共享
+   - 包含 5 个判断维度（组织者、主持人、团队管理员、组织管理员、预订组织者所属任何团队的管理员）
 
-5. **预订数据独立性**：Booking 通过冗余字段保存组织者信息，事件类型的所有权变更不影响已有预订数据。
+5. **统一与分散并存的设计**：
+   - **访问权限**（能看吗？）→ 统一服务 `BookingAccessService`
+   - **操作权限**（能改吗？）→ 分散检查（`disableRescheduling` 等）
+   - **列表权限**（能看哪些？）→ SQL 直接过滤（性能优先）
 
-6. **操作权限依赖当前配置**：改期、取消等操作的权限检查使用**当前 EventType 的设置**，而非预订创建时的快照。
+6. **预订数据独立性**：Booking 通过冗余字段保存组织者信息，事件类型的所有权变更不影响已有预订数据。
+
+7. **操作权限依赖当前配置**：改期、取消等操作的权限检查使用**当前 EventType 的设置**，而非预订创建时的快照。
 
 ### 潜在风险
 
 1. **权限变更影响已有操作**：`disableRescheduling` 等配置变更会影响已有预订的改期能力
 2. **所有权转移后的访问问题**：原创建者可能无法访问自己创建的预订（如果查询逻辑检查当前 EventType 关系）
 3. **缺乏自动通知**：权限变更时没有通知相关预订者的机制
-4. **逻辑分散维护困难**：相似的权限判断在多处实现，存在不一致风险
+4. **操作权限与访问权限分离**：改期/取消权限有独立的检查逻辑，与 `BookingAccessService` 分离，存在不一致风险
 
 ### 改进建议
 
-1. **考虑引入预订配置快照**：确保用户创建预订时的承诺得到保障
-2. **抽取统一的 BookingAccessService**：集中权限判断逻辑，确保一致性
+1. **考虑引入预订配置快照**：确保用户创建预订时的承诺得到保障（解决"操作权限依赖当前配置"的问题）
+
+2. **扩展现有 BookingAccessService**（而非新增）：
+   - **现状**：`BookingAccessService` 已存在，提供统一的**访问权限**判断
+   - **待扩展**：
+     - 增加 `canReschedule()`、`canCancel()` 等**操作权限**判断方法
+     - 抽取列表查询条件构建逻辑，确保与 `doesUserIdHaveAccessToBooking()` 逻辑一致
+     - 统一 `BookingRepository` 层的查询条件，避免逻辑重复和不一致
+
 3. **添加权限变更通知机制**：关键配置变更时通知相关预订者
+
 4. **明确级联策略**：事件类型删除/变更时应有明确的预订处理策略
 
 ---
 
 *报告生成时间：2026-05-03*
 *分析范围：基于代码库静态分析*
+*修正说明：已核实 `BookingAccessService` 是统一的预订访问控制服务，用于 tRPC 和 API v2 两套系统*
