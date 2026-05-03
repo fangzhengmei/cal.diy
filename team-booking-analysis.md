@@ -503,19 +503,24 @@ private async _getBusyTimesFromLimitsForUsers(
 │  │                                                                 │   │
 │  │ 选择 bookingShortfall 最大的用户组                             │   │
 │  │ (缺口最大 = 应该获得更多预订)                                   │   │
+│  │                                                                 │   │
+│  │ ⚠️ 关键: 优先级过滤是在【权重过滤的结果】上进行的               │   │
+│  │    - 如果启用权重: 先权重，再优先级，再 LRB                    │   │
+│  │    - 如果未启用权重: 直接优先级，再 LRB                         │   │
 │  └─────────────────────────────────────────────────────────────┘   │
 │                              │                                        │
-│                              ▼                                        │
+│                              ▼ (权重过滤后的可用用户)                  │
 │  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ 步骤 3: 优先级过滤                                            │   │
+│  │ 步骤 3: 优先级过滤 (总是执行)                                  │   │
 │  │ getUsersWithHighestPriority():                                │   │
 │  │                                                                 │   │
 │  │ - 选择 priority 值最高的用户组                                 │   │
 │  │ - null 优先级视为默认值 2                                      │   │
-│  │ - 优先级相同时继续下一步                                       │   │
+│  │ - 优先级分层: 高优先级用户完全不与低优先级竞争                  │   │
+│  │ - 如果只剩一个用户: 直接返回，跳过 LRB                         │   │
 │  └─────────────────────────────────────────────────────────────┘   │
 │                              │                                        │
-│                              ▼                                        │
+│                              ▼ (优先级过滤后的可用用户)                │
 │  ┌─────────────────────────────────────────────────────────────┐   │
 │  │ 步骤 4: 最近最少预订兜底 (LRB)                                 │   │
 │  │ leastRecentlyBookedUser():                                   │   │
@@ -530,6 +535,40 @@ private async _getBusyTimesFromLimitsForUsers(
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+#### 4.1.1 权重与优先级的实际执行顺序
+
+从 `getLuckyUser_requiresDataToBePreFetched` 方法（`packages/features/bookings/lib/getLuckyUser.ts:716-776`）可以看到实际执行顺序：
+
+```typescript
+// 步骤 1: 权重过滤 (仅 isRRWeightsEnabled=true 时)
+if (eventType.isRRWeightsEnabled) {
+  const { remainingUsersAfterWeightFilter, ... } = this.filterUsersBasedOnWeights({...});
+  availableUsers = remainingUsersAfterWeightFilter;  // 更新可用用户列表
+}
+
+// 步骤 2: 优先级过滤 (总是执行，在权重过滤的结果上)
+const highestPriorityUsers = this.getUsersWithHighestPriority({ availableUsers });
+
+// 步骤 3: LRB 兜底 (在优先级过滤的结果上)
+if (highestPriorityUsers.length === 1) {
+  return highestPriorityUsers[0];  // 只剩一个，跳过 LRB
+}
+return this.leastRecentlyBookedUser({ availableUsers: highestPriorityUsers, ... });
+```
+
+**关键理解**：
+
+| 场景 | 执行顺序 | 说明 |
+|-----|---------|------|
+| **启用权重模式** | 权重过滤 → 优先级过滤 → LRB | 先基于历史缺口选出候选，再在候选中选最高优先级 |
+| **未启用权重模式** | 优先级过滤 → LRB | 跳过权重，直接基于优先级和 LRB 选择 |
+
+**优先级分层的含义**：
+- 优先级是**硬隔离**的，不是软排序
+- 高优先级用户（priority=4）完全不与低优先级用户（priority=0）竞争
+- 即使高优先级用户权重低、历史预订多，只要他可用，就会被优先选中
+- 只有当同一优先级内有多个用户时，才会使用权重/LRB 逻辑
 
 ### 4.2 核心权重分配算法
 
@@ -642,9 +681,77 @@ private filterUsersBasedOnWeights<
 
 ### 4.3 校准机制详解
 
-校准机制是保证公平性的关键，处理两种特殊场景：
+校准机制是保证公平性的关键，处理两种特殊场景：OOO（休假）和新主持人加入。
 
-#### 4.3.1 OOO (Out of Office) 校准
+#### 4.3.0 OOO 数据来源：显式记录 + 历史全日忙碌事件
+
+在 `fetchAllDataNeededForCalculations` 方法中（`packages/features/bookings/lib/getLuckyUser.ts:618-664`），OOO 数据来源于两个渠道：
+
+```typescript
+// ========== 数据源 1: 显式 OOO 记录 ==========
+const oooEntries = await this.oooRepository.findOOOEntriesInInterval({
+  userIds: allRRHosts.map((host) => host.user.id),
+  startDate: intervalStartDate,
+  endDate: intervalEndDate,
+});
+
+// ========== 数据源 2: 日历中的历史全日忙碌事件 ==========
+const userFullDayBusyTimes = new Map<number, { start: Date; end: Date }[]>();
+
+userBusyTimesOfInterval.forEach((userBusyTime) => {
+  const fullDayBusyTimes = userBusyTime.busyTimes
+    .filter((busyTime) => {
+      if (!busyTime.timeZone) return false;
+      const timezoneOffset = dayjs(busyTime.start).tz(busyTime.timeZone).utcOffset() * 60000;
+      let start = new Date(new Date(busyTime.start).getTime() + timezoneOffset);
+      const end = new Date(new Date(busyTime.end).getTime() + timezoneOffset);
+
+      // 关键条件 1: 必须是已结束的事件 (end < now)
+      // 关键条件 2: 时差必须是 24 小时的整数倍
+      return end.getTime() < Date.now() && isFullDayEvent(start, end);
+    })
+    .map((busyTime) => ({ start: new Date(busyTime.start), end: new Date(busyTime.end) }));
+
+  userFullDayBusyTimes.set(userBusyTime.userId, fullDayBusyTimes);
+});
+
+// ========== 合并两种数据源 ==========
+userFullDayBusyTimes.forEach((fullDayBusyTimes, userId) => {
+  const oooEntriesForUser = oooEntriesGroupedByUserId.get(userId) || [];
+  // 合并显式 OOO + 历史全日忙碌
+  const combinedEntries = [...oooEntriesForUser, ...fullDayBusyTimes];
+  // 合并重叠区间
+  const oooEntries = mergeOverlappingRanges(combinedEntries);
+
+  oooData.push({
+    userId,
+    oooEntries,
+  });
+});
+```
+
+**全日忙碌事件的判定条件**（`isFullDayEvent` 函数）：
+
+```typescript
+function isFullDayEvent(date1: Date, date2: Date) {
+  const MILLISECONDS_IN_A_DAY = 24 * 60 * 60 * 1000;
+  const difference = Math.abs(date1.getTime() - date2.getTime());
+  // 时差必须是 24 小时的整数倍
+  return difference % MILLISECONDS_IN_A_DAY === 0;
+}
+```
+
+**OOO 数据来源汇总**：
+
+| 来源类型 | 获取方式 | 条件限制 | 典型场景 |
+|---------|---------|---------|---------|
+| **显式 OOO 记录** | `PrismaOOORepository.findOOOEntriesInInterval` | 无额外限制（除时间区间） | 用户手动设置的休假、请假 |
+| **历史全日忙碌事件** | 从 `getCalendarBusyTimesOfInterval` 筛选 | 1. 必须有 `timeZone` 信息<br>2. 必须是**已结束**的事件 (`end < now`)<br>3. 时差必须是 24 小时的整数倍 | Google Calendar 等日历中的全天事件（如"出差"、"会议"等） |
+
+**设计意图**：
+- 显式 OOO 记录：用户主动标记的不可用时间
+- 历史全日忙碌事件：隐式推断用户可能处于"不可用"状态（如出差、全天会议）
+- 只统计**已结束**的事件：因为这些事件已经"错过"了分配机会，需要进行补偿校准
 
 ```typescript
 // packages/features/bookings/lib/getLuckyUser.ts:226-309
@@ -839,6 +946,373 @@ export const getIntervalEndDate = ({
 |---------|------------------|---------|---------|
 | **创建时间** | `CREATED_AT` | 从预订创建时刻倒推周期 | 实时统计，每日/每月重置 |
 | **会议开始时间** | `START_TIME` | 基于会议实际开始时间 | 按会议日期统计，如"5月15日的会议" |
+
+---
+
+### 4.5 No-Show 配置对公平性的影响
+
+#### 4.5.1 配置项说明
+
+轮询统计中是否计入 No-Show（爽约）由 `EventType.includeNoShowInRRCalculation` 字段控制：
+
+```typescript
+// packages/prisma/schema.prisma:263
+model EventType {
+  // ...
+  includeNoShowInRRCalculation  Boolean  @default(false)
+  // ...
+}
+```
+
+**默认值**: `false`（No-Show 不计入轮询统计）
+
+#### 4.5.2 查询过滤逻辑
+
+在 `BookingRepository.buildWhereClauseForActiveBookings` 方法中（`packages/features/bookings/repositories/BookingRepository.ts:111-165`）：
+
+```typescript
+const buildWhereClauseForActiveBookings = ({
+  includeNoShowInRRCalculation = false,  // 默认不计入
+  users,
+  ...
+}: {...}): Prisma.BookingWhereInput => ({
+  OR: [
+    {
+      userId: { in: users.map((user) => user.id) },
+      // 如果 includeNoShowInRRCalculation 为 false，排除 noShowHost=true 的预订
+      ...(!includeNoShowInRRCalculation
+        ? {
+            OR: [{ noShowHost: false }, { noShowHost: null }],
+          }
+        : {}),
+    },
+    {
+      attendees: {
+        some: {
+          email: { in: users.map((user) => user.email) },
+        },
+      },
+    },
+  ],
+  // 如果 includeNoShowInRRCalculation 为 false，排除 noShow=true 的参与者预订
+  ...(!includeNoShowInRRCalculation ? { attendees: { some: { noShow: false } } } : {}),
+  status: BookingStatus.ACCEPTED,
+  // ...
+});
+```
+
+#### 4.5.3 No-Show 的两个维度
+
+| 维度 | 字段名 | 含义 |
+|-----|-------|------|
+| **组织者维度** | `Booking.noShowHost` | 主持人（组织者）是否爽约 |
+| **参与者维度** | `Attendee.noShow` | 参与者（客户）是否爽约 |
+
+#### 4.5.4 公平性影响分析
+
+**场景示例**：
+```
+团队配置: Alice (权重 100), Bob (权重 100)
+周期: 5月1日 - 5月31日
+
+事件序列:
+- 5月10日: 预订分配给 Alice，但客户爽约 (noShow=true)
+- 5月15日: 新预订请求
+```
+
+**情况 A: includeNoShowInRRCalculation = false（默认）**
+
+```
+5月15日计算:
+- 总预订: 0（因为 Alice 的预订被标记为 noShow，不计入）
+- Alice 实际: 0, 目标: 0 → 缺口: 0
+- Bob 实际: 0, 目标: 0 → 缺口: 0
+
+结果: 公平竞争，Alice 不会因"被分配但客户爽约"而被惩罚
+```
+
+**情况 B: includeNoShowInRRCalculation = true**
+
+```
+5月15日计算:
+- 总预订: 1（Alice 的预订被计入）
+- Alice 实际: 1, 目标: 0.5 → 缺口: -0.5 (超额)
+- Bob 实际: 0, 目标: 0.5 → 缺口: 0.5 (不足)
+
+结果: Bob 缺口更大，优先获得分配
+      Alice 因"客户爽约"而被"惩罚"，暂时失去分配机会
+```
+
+**设计意图**：
+
+| 配置值 | 公平性理念 | 适用场景 |
+|-------|-----------|---------|
+| **false（默认）** | 主持人只对"自己可控的事情"负责<br>客户爽约不是主持人的错 | 大多数业务场景，主持人无法控制客户行为 |
+| **true** | 按"实际分配次数"统计<br>不管客户是否爽约，分配了就算数 | 特殊场景，需要严格按分配次数统计 |
+
+**关键理解**：
+- 默认配置下，No-Show 的预订**不计入**轮询统计
+- 这意味着主持人不会因为"客户爽约"而影响其轮询优先级
+- 这是一种"公平性保护"机制，避免主持人因不可控因素被惩罚
+
+---
+
+### 4.6 连续预订（Recurring Booking）流程
+
+连续预订是指客户一次预订多个周期性的时隙（如每周一 10:00，连续 4 周）。轮询分配在连续预订中有特殊的处理逻辑。
+
+#### 4.6.1 整体流程概览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    连续预订处理流程 (RecurringBookingService)         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  输入: 多个周期性时隙的预订请求                                       │
+│  (如: 5月1日、5月8日、5月15日、5月22日 每周一 10:00)              │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ 阶段 1: 首个周期选人 (isFirstRecurringSlot = true)           │   │
+│  │                                                                 │   │
+│  │  步骤 1.1: 正常轮询分配                                        │   │
+│  │          - 调用 getLuckyUser() 选择主持人                      │   │
+│  │          - 记录 luckyUsers (选中的主持人列表)                  │   │
+│  │                                                                 │   │
+│  │  步骤 1.2: 可用性复验 (可选，由 numSlotsToCheckForAvailability 控制) │   │
+│  │          - 检查选中的主持人是否在后续 N 个时隙都可用            │   │
+│  │          - N = min(总周期数, numSlotsToCheckForAvailability)  │   │
+│  │                                                                 │   │
+│  │  步骤 1.3: 回退/重试 (如果复验失败)                             │   │
+│  │          - 将当前主持人加入 notAvailableLuckyUsers             │   │
+│  │          - 从剩余候选中重新选择                                 │   │
+│  │          - 如果所有候选都不可用 → 抛出错误                      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                        │
+│                              ▼ (首个周期选人完成)                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ 阶段 2: 后续周期复用 (isFirstRecurringSlot = false)          │   │
+│  │                                                                 │   │
+│  │  - 不再重新调用 getLuckyUser()                                 │   │
+│  │  - 直接复用首个周期选中的 luckyUsers                           │   │
+│  │  - 所有周期使用同一批主持人                                    │   │
+│  │                                                                 │   │
+│  │  ⚠️ 关键: 后续周期不进行可用性复验                              │   │
+│  │     假设: 首个周期可用 → 后续周期也可用                         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.6.2 首个周期选人逻辑
+
+从 `RecurringBookingService.handleNewRecurringBooking` 方法（`packages/features/bookings/lib/create-recurring-booking.ts:22-132`）：
+
+```typescript
+// RecurringBookingService 处理流程
+export const handleNewRecurringBooking = async function (...) {
+  const data = input.bookingData;  // 所有周期的预订数据
+  const isRoundRobin = firstBooking.schedulingType === SchedulingType.ROUND_ROBIN;
+
+  let luckyUsers;
+
+  if (isRoundRobin) {
+    // ========== 首个周期单独处理 ==========
+    const firstBooking = data[0];
+    const recurringEventData = {
+      ...firstBooking,
+      isFirstRecurringSlot: true,  // 标记是首个周期
+      numSlotsToCheckForAvailability,  // 需要检查的后续时隙数量
+      currentRecurringIndex: 0,
+      // ...
+    };
+
+    // 调用 RegularBookingService.createBooking
+    // 在 createBooking 内部会进行轮询分配和可用性复验
+    const firstBookingResult = await regularBookingService.createBooking({
+      bookingData: recurringEventData,
+      // ...
+    });
+    
+    // 记录首个周期选中的主持人
+    luckyUsers = firstBookingResult.luckyUsers;
+  }
+
+  // ========== 后续周期复用 ==========
+  for (let key = isRoundRobin ? 1 : 0; key < data.length; key++) {
+    const booking = data[key];
+    
+    const recurringEventData = {
+      ...booking,
+      isFirstRecurringSlot: key == 0,
+      luckyUsers,  // 直接复用首个周期选中的主持人
+      currentRecurringIndex: key,
+      // ...
+    };
+
+    // 后续周期不再重新轮询，直接使用 luckyUsers
+    const eachRecurringBooking = await regularBookingService.createBooking({
+      bookingData: recurringEventData,
+      // ...
+    });
+    
+    createdBookings.push(eachRecurringBooking);
+  }
+
+  return createdBookings;
+};
+```
+
+#### 4.6.3 可用性复验与回退机制
+
+从 `RegularBookingService` 的选人逻辑（`packages/features/bookings/lib/service/RegularBookingService.ts:1049-1087`）：
+
+```typescript
+// 在首个周期选人时，会进行可用性复验
+if (
+  input.bookingData.isFirstRecurringSlot &&
+  eventType.schedulingType === SchedulingType.ROUND_ROBIN &&
+  input.bookingData.numSlotsToCheckForAvailability &&
+  input.bookingData.allRecurringDates
+) {
+  // ========== 尝试选择幸运用户 ==========
+  while (luckyUserPool.length > 0 && !luckUserFound) {
+    const freeUsers = luckyUserPool.filter(
+      (user) => !luckyUsers.concat(notAvailableLuckyUsers).find((existing) => existing.id === user.id)
+    );
+    
+    if (freeUsers.length === 0) break;  // 没有候选了
+    
+    // 调用 getLuckyUser 选择用户
+    const newLuckyUser = await deps.luckyUserService.getLuckyUser({
+      availableUsers: freeUsers,
+      // ...
+    });
+
+    // ========== 可用性复验 ==========
+    try {
+      // 检查选中的用户是否在后续 N 个时隙都可用
+      for (
+        let i = 0;
+        i < input.bookingData.allRecurringDates.length &&
+        i < input.bookingData.numSlotsToCheckForAvailability;
+        i++
+      ) {
+        const start = input.bookingData.allRecurringDates[i].start;
+        const end = input.bookingData.allRecurringDates[i].end;
+
+        if (!skipAvailabilityCheck) {
+          // 调用 ensureAvailableUsers 检查可用性
+          await ensureAvailableUsers(
+            { ...eventTypeWithUsers, users: [newLuckyUser] },
+            {
+              dateFrom: dayjs(start).tz(reqBody.timeZone).format(),
+              dateTo: dayjs(end).tz(reqBody.timeZone).format(),
+              // ...
+            },
+            tracingLogger,
+            calendarFetchMode
+          );
+        }
+      }
+      
+      // ========== 复验通过 ==========
+      luckyUsers.push(newLuckyUser);
+      luckUserFound = true;
+      
+    } catch {
+      // ========== 复验失败: 回退 ==========
+      // 将当前用户加入不可用列表
+      notAvailableLuckyUsers.push(newLuckyUser);
+      
+      // 日志记录
+      tracingLogger.info(
+        `Round robin host ${newLuckyUser.name} not available for first two slots. Trying to find another host.`
+      );
+      
+      // 继续循环，尝试下一个候选
+    }
+  }
+}
+```
+
+#### 4.6.4 回退失败路径
+
+当所有候选主持人都无法通过可用性复验时，会抛出错误：
+
+```typescript
+// RegularBookingService 中的错误处理
+// 在尝试了所有候选用户之后
+
+// 检查是否每个分组都找到了幸运用户
+if (
+  [...qualifiedRRUsers, ...additionalFallbackRRUsers].length > 0 &&
+  luckyUsers.length !== (Object.keys(nonEmptyHostGroups).length || 1)
+) {
+  // 抛出错误: 轮询主持人不可用
+  throw new Error(ErrorCode.RoundRobinHostsUnavailableForBooking);
+}
+```
+
+**错误码定义**（`ErrorCode.NoAvailableUsersFound` vs `ErrorCode.RoundRobinHostsUnavailableForBooking`）：
+
+| 错误场景 | 错误码 | 含义 |
+|---------|-------|------|
+| 单个预订无可用用户 | `NoAvailableUsersFound` | 当前时隙没有可用主持人 |
+| 连续预订复验失败 | `RoundRobinHostsUnavailableForBooking` | 无法找到在所有需要检查的时隙都可用的主持人 |
+
+#### 4.6.5 连续预订的公平性考虑
+
+**设计权衡**：
+
+| 考量因素 | 当前设计 | 权衡说明 |
+|---------|---------|---------|
+| **一致性体验** | 所有周期同一批主持人 | 客户体验一致，不会"这周见 Alice，下周见 Bob" |
+| **轮询公平性** | 后续周期不复用轮询 | 连续预订作为"一个整体"分配，不是多个独立预订 |
+| **可用性保障** | 首个周期复验后续 N 个时隙 | 降低后续周期出现不可用的风险 |
+| **性能优化** | 后续周期不重新轮询 | 避免多次调用 getLuckyUser 的开销 |
+
+**场景示例**：
+
+```
+场景: 客户预订连续 4 周的每周一 10:00
+团队: [Alice, Bob, Charlie] (3人)
+
+正常流程:
+1. 首个周期 (5月1日):
+   - 轮询选择 Alice
+   - 复验 5月1日、5月8日、5月15日 (假设 numSlotsToCheckForAvailability=3)
+   - Alice 在这 3 天都可用 → 确认选中
+   
+2. 后续周期 (5月8日、5月15日、5月22日):
+   - 直接复用 Alice
+   - 不重新轮询
+   - 不进行可用性复验
+
+结果: 4 个周期都分配给 Alice
+```
+
+**异常场景**：
+
+```
+场景: 客户预订连续 4 周
+团队: [Alice, Bob] (2人)
+
+异常流程:
+1. 首个周期选择 Alice
+2. 复验发现 Alice 在 5月8日 不可用 → 回退
+3. 尝试选择 Bob
+4. 复验发现 Bob 在 5月15日 不可用 → 回退
+5. 所有候选都不可用 → 抛出 RoundRobinHostsUnavailableForBooking
+
+结果: 预订失败，提示无法找到合适的主持人
+```
+
+**关键理解**：
+- 连续预订中的轮询分配只在**首个周期**执行
+- 后续周期**复用**首个周期的选择结果
+- 首个周期会**复验**后续 N 个时隙的可用性（可选）
+- 如果复验失败，会**回退**并尝试其他候选人
+- 如果所有候选人都无法通过复验，**预订失败**
 
 ---
 
