@@ -876,6 +876,1064 @@ try {
 
 ---
 
+---
+
+## 附录 A：凭据授权落库与预约选择完整链路
+
+### A.1 概述：完整链路全景
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    完整链路：授权 → 落库 → 关联 → 预约 → 选择                      │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  [阶段 1: OAuth 授权与凭据落库]
+  ┌─────────────┐     ┌─────────────┐     ┌─────────────────┐     ┌────────────────────────┐
+  │  用户点击   │────>│  重定向到  │────>│  OAuth 回调     │────>│  创建 Credential 记录  │
+  │ "添加 Zoom" │     │  Zoom 授权  │     │  换取 token     │     │  (type: zoom_video)    │
+  └─────────────┘     └─────────────┘     └─────────────────┘     └─────────────┬──────────┘
+                                                                                        │
+  [阶段 2: 凭据与事件类型关联]                                                         │
+  ┌─────────────┐     ┌──────────────────────────┐     ┌─────────────────────────┐ │
+  │  用户设置   │────>│  更新 EventType.locations │────>│  记录 { type:           │ │
+  │ 默认会议应用 │     │  保存 credentialId        │     │    "integrations:zoom", │ │
+  │             │     │                         │     │    credentialId: 123 }   │ │
+  └─────────────┘     └──────────────────────────┘     └─────────────────────────┘ │
+                                                                                        │
+  [阶段 3: 预约时凭据选择]                                                             │
+  ┌─────────────┐     ┌──────────────────────────┐     ┌─────────────────────────┐ │
+  │  发起预约   │────>│  解析 location 和        │────>│  三级分支选择凭据        │ │
+  │ 请求        │     │  conferenceCredentialId  │     │  (ID匹配 → 类型匹配 → 兜底)│ │
+  └─────────────┘     └──────────────────────────┘     └─────────────┬───────────┘ │
+                                                                         │             │
+                                                                         ▼             │
+  [阶段 4: 凭据使用与追踪]                                                           │
+  ┌─────────────────┐     ┌──────────────────────────┐     ┌──────────────────────┐ │
+  │  加载适配器     │<────│  调用 VideoApiAdapter    │<────│  使用选中的凭据      │ │
+  │  创建 Zoom 会议 │     │  保存 BookingReference   │     │                      │ │
+  │  返回会议链接   │     │  (含 credentialId)       │     │                      │ │
+  └─────────────────┘     └──────────────────────────┘     └──────────────────────┘ │
+                                                                                        │
+                                                                                        │
+  ┌───────────────────────────────────────────────────────────────────────────────────┘
+  │ 关键数据字段
+  ├─ Credential.type: "zoom_video" (数据库凭据类型标识)
+  ├─ EventType.locations: [{ type: "integrations:zoom", credentialId: 123 }]
+  ├─ CalendarEvent.location: "integrations:zoom"
+  ├─ CalendarEvent.conferenceCredentialId: 123 (可选，优先级最高)
+  └─ BookingReference.credentialId: 123 (追踪哪个凭据被使用)
+```
+
+---
+
+### A.2 阶段 1：OAuth 授权与凭据落库
+
+#### A.2.1 授权流程全景
+
+```
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+│    用户      │         │   Cal.diy    │         │    Zoom      │         │   Database   │
+│ (浏览器)     │         │   (后端)     │         │   (OAuth)    │         │  (Credential)│
+└──────┬───────┘         └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+       │                         │                         │                         │
+       │  点击 "添加 Zoom"       │                         │                         │
+       │────────────────────────>│                         │                         │
+       │                         │                         │                         │
+       │                         │  GET /api/integrations/zoomvideo/add             │
+       │                         │─────────────────────────│                         │
+       │                         │                         │                         │
+       │                         │  302 重定向到 Zoom 授权页                         │
+       │<────────────────────────│                         │                         │
+       │                         │                         │                         │
+       │  跳转至 Zoom 登录/授权页面                        │                         │
+       │─────────────────────────>                         │                         │
+       │                         │                         │                         │
+       │                         │                         │  用户授权同意          │
+       │                         │                         │                         │
+       │                         │  302 回调到 callback    │                         │
+       │<────────────────────────|─────────────────────────|                         │
+       │                         │                         │                         │
+       │                         │  POST /oauth/token      │                         │
+       │                         │  (code → access_token)  │                         │
+       │                         │─────────────────────────>│                         │
+       │                         │                         │                         │
+       │                         │<─────────────────────────│                         │
+       │                         │  { access_token,        │                         │
+       │                         │    refresh_token,       │                         │
+       │                         │    expires_in }          │                         │
+       │                         │                         │                         │
+       │                         │  DELETE old credentials  │                         │
+       │                         │  (防重复)                │                         │
+       │                         │──────────────────────────────────────────────────>│
+       │                         │                         │                         │
+       │                         │  CREATE new credential  │                         │
+       │                         │  (type: zoom_video)     │                         │
+       │                         │  (key: token数据)       │                         │
+       │                         │──────────────────────────────────────────────────>│
+       │                         │                         │                         │
+       │                         │  302 重定向到已安装应用页                          │
+       │<────────────────────────│                         │                         │
+```
+
+#### A.2.2 授权入口：`api/add.ts`
+
+**代码位置**: `packages/app-store/zoomvideo/api/add.ts:12-39`
+
+```typescript
+async function handler(req: NextApiRequest) {
+  // 验证用户登录
+  await prisma.user.findFirstOrThrow({
+    where: { id: req.session?.user?.id },
+    select: { id: true },
+  });
+
+  // 获取 Zoom 应用配置（client_id）
+  const { client_id } = await getZoomAppKeys();
+  
+  // 编码 OAuth state（用于防止 CSRF，可携带 teamId 等参数）
+  const state = encodeOAuthState(req);
+
+  // 构建 OAuth 授权 URL
+  const params = {
+    response_type: "code",
+    client_id,
+    redirect_uri: `${WEBAPP_URL_FOR_OAUTH}/api/integrations/zoomvideo/callback`,
+    state,
+  };
+  const query = stringify(params);
+  
+  // 重定向到 Zoom 授权页面
+  const url = `https://zoom.us/oauth/authorize?${query}`;
+  return { url };
+}
+```
+
+**关键设计**：
+- `encodeOAuthState`: 编码状态参数，包含 `teamId`（用于团队凭据）、`returnTo`（授权后跳转地址）
+- `redirect_uri`: 必须与 Zoom 应用配置的回调 URL 完全匹配
+
+#### A.2.3 OAuth 回调与凭据创建：`api/callback.ts`
+
+**代码位置**: `packages/app-store/zoomvideo/api/callback.ts:12-82`
+
+```typescript
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const state = decodeOAuthState(req);
+  const { code } = req.query;
+  const { client_id, client_secret } = await getZoomAppKeys();
+
+  // ========== 步骤 1: 用 code 换取 token ==========
+  const redirectUri = encodeURI(`${WEBAPP_URL_FOR_OAUTH}/api/integrations/zoomvideo/callback`);
+  const authHeader = `Basic ${Buffer.from(`${client_id}:${client_secret}`).toString("base64")}`;
+  
+  const result = await fetch(
+    `https://zoom.us/oauth/token?grant_type=authorization_code&code=${code}&redirect_uri=${redirectUri}`,
+    {
+      method: "POST",
+      headers: { Authorization: authHeader },
+    }
+  );
+
+  if (result.status !== 200) {
+    res.status(400).json({ message: "Zoom API error" });
+    return;
+  }
+
+  const responseBody = await result.json();
+  if (responseBody.error) {
+    res.status(400).json({ message: responseBody.error });
+    return;
+  }
+
+  // ========== 步骤 2: 处理 token 格式 ==========
+  // 计算过期时间（转换为绝对时间戳）
+  responseBody.expiry_date = Math.round(Date.now() + responseBody.expires_in * 1000);
+  delete responseBody.expires_in;  // 移除相对时间，保存绝对时间
+
+  // ========== 步骤 3: 清理旧凭据（防止重复） ==========
+  const userId = req.session?.user.id;
+  
+  /**
+   * 设计意图：
+   * - 同一用户同一类型的凭据只保留一份
+   * - 避免预约时不知道用哪个凭据的问题
+   * - 重新授权时自动替换旧凭据
+   */
+  const existingCredentialZoomVideo = await prisma.credential.findMany({
+    select: { id: true },
+    where: {
+      type: "zoom_video",      // 按类型查找
+      userId: req.session?.user.id,
+      appId: "zoom",
+    },
+  });
+
+  // 删除旧凭据
+  const credentialIdsToDelete = existingCredentialZoomVideo.map((item) => item.id);
+  if (credentialIdsToDelete.length > 0) {
+    await prisma.credential.deleteMany({ 
+      where: { id: { in: credentialIdsToDelete }, userId } 
+    });
+  }
+
+  // ========== 步骤 4: 创建新凭据 ==========
+  await createOAuthAppCredential(
+    { appId: "zoom", type: "zoom_video" }, 
+    responseBody,  // { access_token, refresh_token, expiry_date }
+    req
+  );
+
+  // ========== 步骤 5: 重定向回应用页面 ==========
+  res.redirect(
+    getSafeRedirectUrl(state?.returnTo) ?? 
+    getInstalledAppPath({ variant: "conferencing", slug: "zoom" })
+  );
+}
+```
+
+**Token 存储格式** (`Credential.key`):
+```json
+{
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUz...",
+  "refresh_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUz...",
+  "expiry_date": 1746403200000,
+  "scope": "meeting:write,user:read"
+}
+```
+
+#### A.2.4 凭据落库核心：`createOAuthAppCredential`
+
+**代码位置**: `packages/app-store/_utils/oauth/createOAuthAppCredential.ts:18-52`
+
+```typescript
+const createOAuthAppCredential = async (
+  appData: { type: string; appId: string },
+  key: unknown,
+  req: NextApiRequest
+) => {
+  const userId = req.session?.user.id;
+  if (!userId) {
+    throw new HttpError({ statusCode: 401, message: "You must be logged in" });
+  }
+
+  // 从 OAuth state 解析团队 ID（如果是团队安装）
+  const state = decodeOAuthState(req);
+
+  // ========== 分支：团队凭据 vs 用户凭据 ==========
+  if (state?.teamId) {
+    // 验证用户是否是该团队管理员
+    await throwIfNotHaveAdminAccessToTeam({ 
+      teamId: state?.teamId ?? null, 
+      userId 
+    });
+
+    // 创建团队凭据（没有 userId，有 teamId）
+    return await prisma.credential.create({
+      data: {
+        type: appData.type,    // "zoom_video"
+        key: key || {},         // token 数据
+        teamId: state.teamId,   // 团队 ID
+        appId: appData.appId,   // "zoom"
+      },
+    });
+  }
+
+  // 创建用户凭据（有 userId）
+  return await prisma.credential.create({
+    data: {
+      type: appData.type,
+      key: key || {},
+      userId,
+      appId: appData.appId,
+    },
+  });
+};
+```
+
+#### A.2.5 Credential 表数据结构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Credential 表                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  字段              │  类型      │  示例值                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id                │  Int       │  123                                   │
+│  type              │  String    │  "zoom_video"                          │
+│  key               │  Json      │  { access_token, refresh_token, ... } │
+│  userId            │  Int?      │  1 (用户凭据) 或 null (团队凭据)       │
+│  teamId            │  Int?      │  null (用户凭据) 或 5 (团队凭据)       │
+│  appId             │  String?   │  "zoom"                                │
+│  invalid           │  Boolean   │  false                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  关键关联关系：
+  ├─ type: 用于按类型筛选凭据（如 `type.endsWith("_video")`）
+  ├─ userId/teamId: 区分用户凭据 vs 团队凭据
+  ├─ appId: 对应 App 表的 slug（用于检查应用是否启用）
+  └─ key: 存储敏感的 token 数据（加密存储在实际部署中）
+```
+
+---
+
+### A.3 阶段 2：凭据与事件类型关联
+
+#### A.3.1 关联方式：两种路径
+
+凭据创建后，需要与事件类型（EventType）关联才能在预约时使用。有两种关联方式：
+
+```
+方式 1：设置为默认会议应用（批量关联所有事件类型）
+        用户操作 ──> setDefaultConferencingApp() ──> 更新所有 EventType.locations
+
+方式 2：在事件类型设置中单独选择（单个事件类型）
+        用户在编辑事件类型时 ──> 选择 Zoom ──> 更新单个 EventType.locations
+```
+
+#### A.3.2 设置默认会议应用：`setDefaultConferencingApp`
+
+**代码位置**: `packages/app-store/_utils/setDefaultConferencingApp.ts:8-57`
+
+```typescript
+const setDefaultConferencingApp = async (userId: number, appSlug: string) => {
+  // ========== 步骤 1: 获取用户所有事件类型 ==========
+  const eventTypes = await getBulkUserEventTypes(userId);
+  const eventTypeIds = eventTypes.eventTypes.map((item) => item.id);
+
+  // ========== 步骤 2: 查找应用元数据，获取 location.type ==========
+  const foundApp = getAppFromSlug(appSlug);
+  const appType = foundApp?.appData?.location?.type;  // "integrations:zoom"
+
+  if (!appType) return;
+
+  // ========== 步骤 3: 查找用户的对应凭据 ==========
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { 
+      metadata: true, 
+      credentials: true  // 获取所有凭据
+    },
+  });
+
+  // 找到对应的 credentialId（按 appSlug 匹配）
+  const credentialId = user?.credentials.find((item) => item.appId == appSlug)?.id;
+
+  // ========== 步骤 4: 更新用户默认设置（元数据） ==========
+  const currentMetadata = userMetadata.parse(user?.metadata);
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      metadata: {
+        ...currentMetadata,
+        defaultConferencingApp: {
+          appSlug,  // "zoom"
+        },
+      },
+    },
+  });
+
+  // ========== 步骤 5: 批量更新所有事件类型的 locations ==========
+  await prisma.eventType.updateMany({
+    where: {
+      id: { in: eventTypeIds },
+      userId,
+    },
+    data: {
+      // 核心：将 location 和 credentialId 绑定
+      locations: [
+        { 
+          type: appType,        // "integrations:zoom"
+          credentialId           // 123（凭据 ID）
+        }
+      ] as LocationObject[],
+    },
+  });
+};
+```
+
+#### A.3.3 EventType.locations 数据结构
+
+**存储在 `EventType.locations` 字段（Json 类型）**:
+
+```json
+[
+  {
+    "type": "integrations:zoom",
+    "credentialId": 123,
+    "teamName": null,
+    "displayLocationPublicly": false
+  }
+]
+```
+
+**关键关联字段**：
+| 字段 | 用途 | 示例值 |
+|------|------|--------|
+| `type` | 标识集成类型，对应 `metadata.appData.location.type` | `"integrations:zoom"` |
+| `credentialId` | 对应 `Credential.id`，预约时用于精确匹配凭据 | `123` |
+| `teamName` | 团队凭据时显示团队名称 | `"Engineering Team"` |
+| `displayLocationPublicly` | 是否在预约页面显示位置详情 | `true` |
+
+#### A.3.4 前端位置选择组件
+
+**代码位置**: `apps/web/modules/event-types/components/locations/Locations.tsx`
+
+```typescript
+// 用户选择 Zoom 作为位置时的处理
+const handleLocationSelect = (e: TPrefillLocation) => {
+  const newLocationType = e.value;  // "integrations:zoom"
+  const canAppendLocation = !validLocations.find(
+    (location) => location.type === newLocationType
+  );
+
+  if (canAppendLocation) {
+    append({
+      type: newLocationType,
+      // 关键：保存 credentialId
+      ...(e.credentialId && {
+        credentialId: e.credentialId,
+        teamName: e.teamName ?? undefined,
+      }),
+    });
+  }
+};
+```
+
+---
+
+### A.4 阶段 3：预约时凭据选择（三级分支逻辑）
+
+#### A.4.1 整体流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                        预约时凭据选择：三级分支决策树                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+  预约请求
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  RegularBookingService.handler()                                                         │
+│  ├─ 从 reqBody 获取 location（如 "integrations:zoom"）                                  │
+│  ├─ 从 eventType.locations 解析 credentialId                                             │
+│  └─ 构建 CalendarEvent { location, conferenceCredentialId }                             │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  EventManager.getVideoCredentialByCalendarEvent(event)                                   │
+│                                                                                            │
+│  输入参数：                                                                                │
+│  ├─ event.location: "integrations:zoom"                                                  │
+│  └─ event.conferenceCredentialId: 123 (可选)                                            │
+│                                                                                            │
+│  可用凭据池 (this.videoCredentials):                                                      │
+│  ├─ [0] { id: 123, type: "zoom_video", userId: 1, ... }                                │
+│  ├─ [1] { id: 456, type: "zoom_video", userId: 2, ... }  ← 团队成员的凭据              │
+│  └─ [2] { id: 789, type: "google_video", userId: 1, ... }                              │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  ========== 分支 1：优先使用 conferenceCredentialId（精确 ID 匹配） ==========          │
+│  if (event.conferenceCredentialId) {                                                    │
+│      return this.videoCredentials.find(                                                 │
+│          (credential) => credential.id === event.conferenceCredentialId                │
+│      );                                                                                  │
+│  }                                                                                        │
+│                                                                                            │
+│  匹配逻辑：credential.id === 123                                                          │
+│  结果：找到 { id: 123, type: "zoom_video", ... }                                        │
+│                                                                                            │
+│  为什么优先？                                                                               │
+│  ├─ 更可靠：ID 是唯一的，不会有歧义                                                       │
+│  ├─ 支持团队：可以精确指定使用哪个团队成员的凭据                                           │
+│  └─ 避免"类型包含"带来的问题（见下方潜在 bug 说明）                                      │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │ 未找到（credentialId 无效或凭据已删除）
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  ========== 分支 2：回退 - 按类型模糊匹配 ==========                                    │
+│  else {                                                                                   │
+│      const integrationName = event.location.replace("integrations:", "");  // "zoom"  │
+│      return this.videoCredentials.find(                                                  │
+│          (credential) => credential.type.includes(integrationName)                      │
+│      );                                                                                   │
+│  }                                                                                         │
+│                                                                                             │
+│  匹配逻辑：credential.type.includes("zoom")                                              │
+│  检查：                                                                                     │
+│  ├─ "zoom_video".includes("zoom")  →  ✓ true                                            │
+│  ├─ "google_video".includes("zoom") →  ✗ false                                          │
+│  └─ "zoom_teams".includes("zoom")   →  ⚠ true (潜在问题！)                              │
+│                                                                                             │
+│  ⚠️  潜在 Bug 风险：                                                                        │
+│  如果有两个应用："zoom_video" 和 "zoom_teams"，模糊匹配可能选错凭据！                    │
+└───────────────────────────────────────────┬─────────────────────────────────────────────┘
+                                            │ 未找到（用户没有安装该集成）
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│  ========== 分支 3：兜底 - 使用 Daily.co 虚拟凭据 ==========                            │
+│  if (!videoCredential) {                                                                 │
+│      log.warn("Falling back to daily video integration");                               │
+│      videoCredential = { ...FAKE_DAILY_CREDENTIAL };                                   │
+│  }                                                                                         │
+│                                                                                             │
+│  FAKE_DAILY_CREDENTIAL 是什么？                                                            │
+│  ├─ 不是数据库中的真实凭据                                                                 │
+│  ├─ 硬编码的 "凭据" 用于访问 Daily.co API                                                  │
+│  ├─ Daily.co 是 Cal.diy 内置的视频会议服务                                                 │
+│  └─ 不需要用户单独授权，始终可用                                                           │
+│                                                                                             │
+│  设计意图：                                                                                  │
+│  - 即使视频集成出错，预约也不能失败                                                        │
+│  - 至少提供一个可用的会议链接                                                              │
+│  - 后续可以发送邮件让用户重新授权                                                          │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### A.4.2 完整代码解析
+
+**代码位置**: `packages/features/bookings/lib/EventManager.ts:1036-1069`
+
+```typescript
+private getVideoCredentialByCalendarEvent(
+  event: CalendarEvent
+): CredentialForCalendarService | undefined {
+  
+  // ========== 前置检查：没有位置就没有视频集成 ==========
+  if (!event.location) {
+    return undefined;
+  }
+
+  /**
+   * @fixme 注释中的潜在 Bug 说明
+   * 
+   * 问题：Google Meet 的保存方式
+   * - 位置类型："integrations:google:meet"
+   * - 提取：integrationName = "google:meet"
+   * - 凭据类型："google_video" (不是 "google:meet_video")
+   * 
+   * 匹配失败："google_video".includes("google:meet") → false
+   * 
+   * 但为什么实际能工作？因为 Google Meet 有特殊处理：
+   * - Google Meet 不是独立的集成
+   * - 它是 Google Calendar 集成的"副产品"
+   * - 创建日历事件时自动获得 hangoutLink
+   */
+  // 从 location 提取集成名称
+  // "integrations:zoom" → "zoom"
+  // "integrations:google:meet" → "google:meet" (注意这里有特殊处理)
+  const integrationName = event.location.replace("integrations:", "");
+  
+  let videoCredential;
+
+  // ========== 分支 1：优先使用 conferenceCredentialId（精确匹配） ==========
+  if (event.conferenceCredentialId) {
+    // 使用 === 精确匹配 ID
+    videoCredential = this.videoCredentials.find(
+      (credential) => credential.id === event.conferenceCredentialId
+    );
+  } 
+
+  // ========== 分支 2：回退 - 按类型模糊匹配 ==========
+  else {
+    // 使用 includes 模糊匹配
+    // "zoom_video".includes("zoom") → true
+    videoCredential = this.videoCredentials.find(
+      (credential: CredentialForCalendarService) =>
+        credential.type.includes(integrationName)
+    );
+    
+    // 记录警告：这是降级路径，不如精确匹配可靠
+    log.warn(
+      `Could not find conferenceCredentialId for event with location: ${event.location}, ` +
+      `trying to use last added video credential`
+    );
+  }
+
+  // ========== 分支 3：兜底 - 使用 Daily.co ==========
+  if (!videoCredential) {
+    log.warn(
+      `Falling back to "daily" video integration for event with location: ${event.location} ` +
+      `because credential is missing for the app`
+    );
+    // FAKE_DAILY_CREDENTIAL 是硬编码的虚拟凭据
+    videoCredential = { ...FAKE_DAILY_CREDENTIAL };
+  }
+
+  return videoCredential;
+}
+```
+
+#### A.4.3 分支决策表
+
+| 场景 | `conferenceCredentialId` | `videoCredentials` 匹配结果 | 使用凭据 | 可靠性 |
+|------|---------------------------|------------------------------|----------|--------|
+| **正常场景** | 123 | `{id:123, type:"zoom_video"}` 匹配 | ID 为 123 的凭据 | **高** |
+| **凭据被删除** | 123 | 无匹配（ID 123 不存在） | 按类型模糊匹配 | **中** |
+| **无 credentialId** | undefined | `{id:123, type:"zoom_video"}` | 类型包含 "zoom" 的凭据 | **低** |
+| **用户未安装 Zoom** | undefined | 无类型匹配 | FAKE_DAILY_CREDENTIAL | **最低** |
+
+#### A.4.4 conferenceCredentialId 来源链路
+
+让我详细追踪 `conferenceCredentialId` 是如何从 `EventType.locations` 传递到 `CalendarEvent` 的：
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│                         conferenceCredentialId 传递链路                                      │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  数据库
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ EventType.locations = [{"type":"integrations:zoom","credentialId":123}]             │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  RegularBookingService.handler()
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 输入：eventType.locations (从数据库加载)                                             │
+  │ const eventType = await prisma.eventType.findUnique({                                  │
+  │     where: { id: eventTypeId },                                                         │
+  │     select: { ..., locations: true }                                                    │
+  │ });                                                                                      │
+  │                                                                                           │
+  │ // locationBodyString 来自哪里？                                                         │
+  │ // - 通常是 eventType.locations 中配置的默认位置                                         │
+  │ // - 或者是预约请求中覆盖的位置                                                           │
+  │ const locationBodyString = reqBody.location ??                                          │
+  │   (eventType.locations?.[0]?.type || "");  // "integrations:zoom"                     │
+  │                                                                                           │
+  │ // ========== 关键转换：getLocationValueForDB ==========                                │
+  │ const { bookingLocation, conferenceCredentialId: eventTypeCredentialId } =             │
+  │     getLocationValueForDB(                                                               │
+  │         locationBodyString,     // "integrations:zoom"                                 │
+  │         eventType.locations      // [{type:"integrations:zoom", credentialId:123}]   │
+  │     );                                                                                   │
+  │                                                                                           │
+  │ // 结果：                                                                                  │
+  │ // bookingLocation = "integrations:zoom" (或实际链接，如果是静态类型)                   │
+  │ // conferenceCredentialId = 123                                                          │
+  │                                                                                           │
+  │ // ========== 构建 CalendarEvent ==========                                              │
+  │ const conferenceCredentialId = eventTypeCredentialId;                                   │
+  │                                                                                           │
+  │ let evt = new CalendarEventBuilder({...})                                                │
+  │     .withLocation({                                                                       │
+  │         location: platformBookingLocation ?? bookingLocation,                           │
+  │         conferenceCredentialId,  // 123 传递进去                                        │
+  │     })                                                                                    │
+  │     .build();                                                                             │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  CalendarEvent
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ {                                                                                         │
+  │   location: "integrations:zoom",                                                         │
+  │   conferenceCredentialId: 123,  // 关键：被 EventManager 使用                          │
+  │   startTime: "2026-05-05T10:00:00Z",                                                   │
+  │   // ...                                                                                  │
+  │ }                                                                                         │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  EventManager
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ private getVideoCredentialByCalendarEvent(event) {                                      │
+  │     // 现在可以使用 event.conferenceCredentialId = 123                                  │
+  │     if (event.conferenceCredentialId) {                                                  │
+  │         // 分支 1：精确匹配                                                              │
+  │         return this.videoCredentials.find(c => c.id === 123);                          │
+  │     }                                                                                     │
+  │     // ...                                                                                │
+  │ }                                                                                         │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### A.4.5 核心转换函数：`getLocationValueForDB`
+
+**代码位置**: `packages/app-store/locations.ts:412-441`
+
+```typescript
+export const getLocationValueForDB = (
+  bookingLocationTypeOrValue: EventLocationType["type"],  // "integrations:zoom"
+  eventLocations: LocationObject[]                        // 来自 eventType.locations
+): { bookingLocation: string; conferenceCredentialId?: number } => {
+  
+  let bookingLocation = bookingLocationTypeOrValue;
+  let conferenceCredentialId: number | undefined;
+
+  // ========== 遍历 eventType.locations 找匹配 ==========
+  eventLocations.forEach((location) => {
+    // 匹配条件：location.type === "integrations:zoom"
+    if (location.type === bookingLocationTypeOrValue) {
+      
+      const eventLocationType = getEventLocationType(bookingLocationTypeOrValue);
+      
+      // ========== 提取 credentialId（关键！） ==========
+      conferenceCredentialId = location.credentialId;  // 123
+      
+      if (!eventLocationType) {
+        return;
+      }
+      
+      // ========== 处理静态 vs 动态链接 ==========
+      // 动态链接（如 Zoom）：保持 type 字符串，不保存实际链接
+      // 静态链接（如自定义链接）：保存实际 URL
+      if (!eventLocationType.default && eventLocationType.linkType === "dynamic") {
+        // 动态链接类型：bookingLocation 保持为 type
+        // 会议链接会在预约时通过 API 动态生成
+        return;
+      }
+
+      // 静态链接类型：获取实际值
+      bookingLocation = location[eventLocationType.defaultValueVariable] || bookingLocation;
+    }
+  });
+
+  // ========== 兜底：如果没有位置，使用 Daily.co ==========
+  if (bookingLocation.trim().length === 0) {
+    bookingLocation = DailyLocationType;  // "integrations:daily"
+  }
+
+  return { bookingLocation, conferenceCredentialId };
+};
+```
+
+#### A.4.6 动态 vs 静态链接类型
+
+| 类型 | `linkType` | 存储值 | 示例 |
+|------|------------|--------|------|
+| **动态链接** | `"dynamic"` | 存储 `type` | `"integrations:zoom"`（预约时生成链接） |
+| **静态链接** | `"static"` | 存储实际 URL | `"https://zoom.us/j/123456"` |
+
+**为什么要区分？**
+- **动态链接**：每次预约都调用 Zoom API 创建新会议，生成新链接
+- **静态链接**：用户提前提供固定链接，所有预约都用同一个链接
+
+---
+
+### A.5 阶段 4：凭据使用与追踪
+
+#### A.5.1 凭据使用流程
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              凭据使用完整流程                                                 │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  EventManager.createVideoEvent(event)
+      │
+      ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 1：选择凭据                                                                      │
+  │ const credential = this.getVideoCredentialByCalendarEvent(event);                      │
+  │ // credential = { id: 123, type: "zoom_video", key: {...}, userId: 1, appId: "zoom" }│
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 2：调用 videoClient                                                              │
+  │ return createMeeting(credential, event);                                                │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  videoClient.createMeeting()
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 3：检查应用是否启用                                                              │
+  │ const enabledApp = await prisma.app.findUnique({                                        │
+  │     where: { slug: credential.appId },  // "zoom"                                       │
+  │     select: { enabled: true }                                                           │
+  │ });                                                                                      │
+  │                                                                                           │
+  │ if (!enabledApp?.enabled)                                                                │
+  │     throw `Location app ${credential.appId} is disabled`;                               │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 4：获取适配器                                                                     │
+  │ const videoAdapters = await getVideoAdapters([credential]);                            │
+  │ // 内部：                                                                                 │
+  │ // - credential.type = "zoom_video"                                                      │
+  │ // - appName = "zoomvideo" (去掉下划线)                                                 │
+  │ // - 动态加载 import("./zoomvideo/lib/VideoApiAdapter")                                │
+  │ // - 调用 ZoomVideoApiAdapter(credential) 创建实例                                       │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 5：创建会议                                                                      │
+  │ const [firstVideoAdapter] = videoAdapters;                                              │
+  │ const createdMeeting = await firstVideoAdapter?.createMeeting(calEvent);               │
+  │                                                                                           │
+  │ // 返回：                                                                                 │
+  │ // {                                                                                      │
+  │ //   id: "1234567890",                                                                   │
+  │ //   url: "https://zoom.us/j/1234567890?pwd=abc123",                                   │
+  │ //   password: "abc123",                                                                 │
+  │ //   type: "zoom_video"                                                                  │
+  │ // }                                                                                      │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 6：构建返回对象（包含 credentialId）                                            │
+  │ return {                                                                                 │
+  │     appName: credential.appName || credential.appId || "",                              │
+  │     type: credential.type,          // "zoom_video"                                     │
+  │     uid,                                                                                  │
+  │     originalEvent: calEvent,                                                             │
+  │     success: true,                                                                       │
+  │     createdEvent: createdMeeting,                                                        │
+  │     credentialId: credential.id,   // 123（关键：用于追踪）                             │
+  │ };                                                                                       │
+  └───────────────────────────────────────────┬────────────────────────────────────────────┘
+                                              │
+                                              ▼
+  EventManager.create()
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │ // 步骤 7：构建 referencesToCreate                                                       │
+  │ const referencesToCreate = results.map((result) => {                                    │
+  │     return {                                                                              │
+  │         type: result.type,                    // "zoom_video"                            │
+  │         uid: result.createdEvent?.id,         // "1234567890"                          │
+  │         meetingId: result.createdEvent?.id,   // "1234567890"                          │
+  │         meetingPassword: result.createdEvent?.password,  // "abc123"                   │
+  │         meetingUrl: result.createdEvent?.url, // "https://zoom.us/j/..."                │
+  │         credentialId: result.credentialId,    // 123（追踪哪个凭据创建的）              │
+  │     };                                                                                    │
+  │ });                                                                                       │
+  │                                                                                           │
+  │ // 保存到 BookingReference 表                                                            │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### A.5.2 BookingReference 数据结构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          BookingReference 表                                                  │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│  字段               │  类型      │  示例值                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│  id                 │  Int       │  456                                                      │
+│  bookingId          │  Int       │  789                                                      │
+│  type               │  String    │  "zoom_video"                                             │
+│  uid                │  String    │  "1234567890"  (Zoom 会议 ID)                           │
+│  meetingId          │  String?   │  "1234567890"                                            │
+│  meetingPassword    │  String?   │  "abc123"                                                 │
+│  meetingUrl         │  String?   │  "https://zoom.us/j/1234567890?pwd=abc123"             │
+│  credentialId       │  Int?      │  123  (对应 Credential.id)                                │
+│  deleted            │  Boolean   │  false                                                    │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  关键关联：
+  ├─ BookingReference.credentialId ──> Credential.id
+  ├─ BookingReference.type ──> Credential.type (用于识别集成类型)
+  └─ BookingReference.uid ──> Zoom 会议 ID (用于后续更新/删除会议)
+```
+
+#### A.5.3 为什么要保存 credentialId？
+
+| 场景 | 用途 |
+|------|------|
+| **改期预约** | 找到原凭据，调用 `updateMeeting` 更新会议时间 |
+| **取消预约** | 找到原凭据，调用 `deleteMeeting` 删除 Zoom 会议 |
+| **故障排查** | 知道是哪个凭据出了问题，帮助用户重新授权 |
+| **审计追踪** | 记录哪些凭据被哪些预约使用 |
+
+---
+
+### A.6 关键数据结构关联图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     完整数据关联图                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────┐
+  │      User        │
+  │  id: 1           │
+  └────────┬─────────┘
+           │
+           │ 1:N
+           ▼
+  ┌──────────────────┐         ┌──────────────────────────────────────────────────────────┐
+  │    Credential    │         │  数据示例                                                 │
+  ├──────────────────┤         ├──────────────────────────────────────────────────────────┤
+  │ id: 123          │         │  {                                                       │
+  │ type: "zoom_vid..│◄────────│    type: "zoom_video",                                  │
+  │ userId: 1        │         │    key: { access_token, refresh_token, expiry_date },  │
+  │ appId: "zoom"    │         │    userId: 1,                                            │
+  │ key: {...}       │         │    appId: "zoom"                                         │
+  └────────┬─────────┘         │  }                                                       │
+           │                   └──────────────────────────────────────────────────────────┘
+           │
+           │ 被 EventType.locations 引用
+           │
+           ▼
+  ┌──────────────────┐         ┌──────────────────────────────────────────────────────────┐
+  │    EventType     │         │  数据示例 (locations 字段)                               │
+  ├──────────────────┤         ├──────────────────────────────────────────────────────────┤
+  │ id: 500          │         │  [                                                       │
+  │ userId: 1        │         │    {                                                     │
+  │ locations: [..]  │◄────────│      type: "integrations:zoom",                        │
+  └────────┬─────────┘         │      credentialId: 123  ◄──── 引用 Credential.id       │
+           │                   │    }                                                     │
+           │                   │  ]                                                       │
+           │                   └──────────────────────────────────────────────────────────┘
+           │ 决定预约时的默认位置
+           │
+           ▼
+  ┌──────────────────┐         ┌──────────────────────────────────────────────────────────┐
+  │  CalendarEvent   │         │  数据示例                                                 │
+  ├──────────────────┤         ├──────────────────────────────────────────────────────────┤
+  │ location: "in..  │◄────────│  {                                                       │
+  │ conferenceCre..  │         │    location: "integrations:zoom",                      │
+  │ startTime: ".."  │         │    conferenceCredentialId: 123,  ◄── 从 EventType 来   │
+  └────────┬─────────┘         │    startTime: "2026-05-05T10:00:00Z"                  │
+           │                   │  }                                                       │
+           │                   └──────────────────────────────────────────────────────────┘
+           │ 被 EventManager 用于选择凭据
+           │
+           ▼
+  ┌──────────────────┐
+  │  EventManager    │  使用 conferenceCredentialId 或 location 从 videoCredentials 中
+  └────────┬─────────┘  选择对应的 Credential
+           │
+           │ 创建会议后生成引用
+           │
+           ▼
+  ┌──────────────────┐         ┌──────────────────────────────────────────────────────────┐
+  │ BookingReference │         │  数据示例                                                 │
+  ├──────────────────┤         ├──────────────────────────────────────────────────────────┤
+  │ id: 999          │         │  {                                                       │
+  │ bookingId: 789   │         │    type: "zoom_video",                                  │
+  │ type: "zoom_vid..│         │    uid: "1234567890",  (Zoom 会议 ID)                 │
+  │ uid: "123456.."  │         │    meetingUrl: "https://zoom.us/j/...",                │
+  │ credentialId: 123│◄────────│    credentialId: 123,  ◄── 回溯到哪个凭据创建的         │
+  │ meetingUrl: "h.. │         │    meetingPassword: "abc123"                            │
+  └──────────────────┘         │  }                                                       │
+                               └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+### A.7 完整时序图
+
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐     ┌────────────┐     ┌────────────┐
+│   User     │     │   Frontend │     │   Backend  │     │   OAuth    │     │  Database  │
+│            │     │            │     │            │     │   Provider │     │            │
+└─────┬──────┘     └─────┬──────┘     └─────┬──────┘     └─────┬──────┘     └─────┬──────┘
+      │                   │                   │                   │                   │
+      │                   │                   │                   │                   │
+      │ [阶段 1: OAuth 授权]                                                 │
+      │                   │                   │                   │                   │
+      │ 点击"添加 Zoom"  │                   │                   │                   │
+      │──────────────────>│                   │                   │                   │
+      │                   │                   │                   │                   │
+      │                   │ GET /api/zoomvideo/add              │                   │
+      │                   │──────────────────>│                   │                   │
+      │                   │                   │                   │                   │
+      │                   │                   │ 构建 OAuth URL    │                   │
+      │                   │                   │                   │                   │
+      │                   │ 302 重定向到授权页                   │                   │
+      │<──────────────────│                   │                   │                   │
+      │                   │                   │                   │                   │
+      │ 重定向到 Zoom 登录页面                │                   │                   │
+      │───────────────────────────────────────>│                   │                   │
+      │                   │                   │                   │                   │
+      │                   │                   │                   │ 用户授权同意      │
+      │                   │                   │                   │                   │
+      │                   │ 302 回调到 callback│                   │                   │
+      │<──────────────────|───────────────────│                   │                   │
+      │                   │                   │                   │                   │
+      │                   │                   │ POST /token (换取 token)              │
+      │                   │                   │──────────────────>│                   │
+      │                   │                   │                   │                   │
+      │                   │                   │<──────────────────│                   │
+      │                   │                   │ { access_token,.. }                   │
+      │                   │                   │                   │                   │
+      │                   │                   │ DELETE old credentials              │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │                   │                   │ CREATE new Credential                │
+      │                   │                   │ (type: zoom_video)                   │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │                   │ 302 重定向到已安装应用页              │                   │
+      │<──────────────────│                   │                   │                   │
+      │                   │                   │                   │                   │
+      │ [阶段 2: 关联事件类型]                                                │
+      │                   │                   │                   │                   │
+      │ 设置 Zoom 为默认 │                   │                   │                   │
+      │──────────────────>│                   │                   │                   │
+      │                   │                   │                   │                   │
+      │                   │ POST 设置默认会议应用               │                   │
+      │                   │──────────────────>│                   │                   │
+      │                   │                   │                   │                   │
+      │                   │                   │ UPDATE EventType.locations           │
+      │                   │                   │ {type:"integrations:zoom",           │
+      │                   │                   │  credentialId:123}                    │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │ [阶段 3: 预约时凭据选择]                                              │
+      │                   │                   │                   │                   │
+      │ 发起预约请求      │                   │                   │                   │
+      │──────────────────>│                   │                   │                   │
+      │                   │                   │                   │                   │
+      │                   │ POST /book        │                   │                   │
+      │                   │──────────────────>│                   │                   │
+      │                   │                   │                   │                   │
+      │                   │                   │ 加载 EventType.locations              │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │                   │                   │<──────────────────────────────────────│
+      │                   │                   │ [{type:"integrations:zoom",         │
+      │                   │                   │   credentialId:123}]                  │
+      │                   │                   │                   │                   │
+      │                   │                   │ getLocationValueForDB()              │
+      │                   │                   │ 提取 conferenceCredentialId=123      │
+      │                   │                   │                   │                   │
+      │                   │                   │ EventManager.getVideoCredential...() │
+      │                   │                   │ 分支 1: ID 精确匹配 (123)          │
+      │                   │                   │                   │                   │
+      │                   │                   │ 加载用户凭据                        │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │                   │                   │<──────────────────────────────────────│
+      │                   │                   │ Credential {id:123, type:zoom_video}│
+      │                   │                   │                   │                   │
+      │ [阶段 4: 凭据使用与追踪]                                              │
+      │                   │                   │                   │                   │
+      │                   │                   │ getVideoAdapters([credential])      │
+      │                   │                   │ 动态加载 ZoomVideoApiAdapter         │
+      │                   │                   │                   │                   │
+      │                   │                   │ adapter.createMeeting(event)         │
+      │                   │                   │                   │                   │
+      │                   │                   │ POST Zoom API 创建会议               │
+      │                   │                   │──────────────────>│                   │
+      │                   │                   │                   │                   │
+      │                   │                   │<──────────────────│                   │
+      │                   │                   │ {id, url, password}                  │
+      │                   │                   │                   │                   │
+      │                   │                   │ CREATE BookingReference               │
+      │                   │                   │ {type:zoom_video,                    │
+      │                   │                   │  credentialId:123,                   │
+      │                   │                   │  meetingUrl:"https://..."}            │
+      │                   │                   │──────────────────────────────────────>│
+      │                   │                   │                   │                   │
+      │                   │ 返回预约确认（含会议链接）           │                   │
+      │                   │<──────────────────│                   │                   │
+      │<──────────────────│                   │                   │                   │
+```
+
+---
+
 ## 6. 完整调用时序图
 
 ### 6.1 新预约视频会议创建时序
