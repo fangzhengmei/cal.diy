@@ -911,6 +911,489 @@ public async reschedule(
 
 ---
 
+### 4.6 改期后系列标识继承机制（深度解析）
+
+当用户改期（reschedule）一个预约时，`recurringEventId` 的继承逻辑是理解系列归属的核心。本节将沿 `createBooking` 数据流详细解析继承优先级、触发条件，以及站内改期与外部日历回写改期两条路径的最终落库结果。
+
+---
+
+#### 4.6.1 核心数据流：从请求到落库
+
+改期操作的完整数据流如下：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    createBooking 数据流与 recurringEventId 继承              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+【入口：RegularBookingService.createBooking()】
+
+输入参数：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ bookingData: {                                                               │
+│   rescheduleUid: "abc123",      // 关键：原预约 UID，存在则表示是改期       │
+│   recurringEventId: "recur_xyz", // 可选：显式传递的系列 ID（优先级 1）      │
+│   start: "2024-01-16T14:00:00Z",                                            │
+│   end: "2024-01-16T14:30:00Z",                                              │
+│   // ... 其他参数                                                             │
+│ }                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+【步骤 1：判断是否为改期】
+
+if (bookingData.rescheduleUid) {
+  // 是改期操作
+  const originalRescheduledBooking = 
+    await getOriginalRescheduledBooking(rescheduleUid, seatsEventType);
+  // 获取原预约的完整信息，包括 recurringEventId
+} else {
+  // 是新建预约
+  originalRescheduledBooking = null;
+}
+        │
+        ▼
+【步骤 2：buildNewBookingData() - 核心继承逻辑】
+
+function buildNewBookingData(params) {
+  const { reqBody, originalRescheduledBooking, ... } = params;
+  
+  // 默认值
+  let recurringEventId = null;
+  
+  // ┌─────────────────────────────────────────────────────────────────────────┐
+  // │ 优先级 1：请求参数显式传递 (reqBody.recurringEventId)                    │
+  // └─────────────────────────────────────────────────────────────────────────┘
+  // 触发条件：
+  // - 重复预约批量创建时，RecurringBookingService 显式传递相同的 ID
+  // - 所有 slot 共享同一个 recurringEventId
+  
+  if (reqBody.recurringEventId) {
+    recurringEventId = reqBody.recurringEventId;
+    console.log("优先级 1 生效：使用请求传递的 recurringEventId");
+  }
+  
+  // ┌─────────────────────────────────────────────────────────────────────────┐
+  // │ 优先级 2：从原预约继承 (originalRescheduledBooking.recurringEventId)      │
+  // └─────────────────────────────────────────────────────────────────────────┘
+  // 触发条件：
+  // - 存在 rescheduleUid（是改期操作）
+  // - getOriginalRescheduledBooking() 返回的原预约有 recurringEventId
+  // - 注意：这会覆盖优先级 1 的值（因为代码顺序在后面）
+  
+  if (originalRescheduledBooking) {
+    // ... 其他属性继承（metadata, paid, fromReschedule 等）
+    
+    if (originalRescheduledBooking.recurringEventId) {
+      recurringEventId = originalRescheduledBooking.recurringEventId;
+      console.log("优先级 2 生效：继承原预约的 recurringEventId");
+    }
+  }
+  
+  // ┌─────────────────────────────────────────────────────────────────────────┐
+  // │ 优先级 3：默认值 (null)                                                   │
+  // └─────────────────────────────────────────────────────────────────────────┘
+  // 触发条件：
+  // - 不是改期（没有 rescheduleUid）
+  // - 或者原预约没有 recurringEventId
+  
+  return {
+    ...newBookingData,
+    recurringEventId,  // 最终值
+  };
+}
+        │
+        ▼
+【步骤 3：落库（Prisma 事务）】
+
+prisma.$transaction(async (tx) => {
+  // 3a：更新原预约（如果是改期）
+  if (originalRescheduledBooking) {
+    await tx.booking.update({
+      where: { uid: originalRescheduledBooking.uid },
+      data: {
+        rescheduled: true,                    // 标记为已改期
+        status: BookingStatus.CANCELLED,      // 状态改为已取消
+        // 注意：recurringEventId 保持不变！
+      },
+    });
+  }
+  
+  // 3b：创建新预约
+  const newBooking = await tx.booking.create({
+    data: {
+      uid: newUid,
+      recurringEventId: calculatedValue,  // 继承逻辑计算出的最终值
+      fromReschedule: originalRescheduledBooking?.uid,
+      // ... 其他字段
+    },
+  });
+  
+  return newBooking;
+});
+```
+
+---
+
+#### 4.6.2 继承优先级与触发条件详解
+
+| 优先级 | 来源 | 触发条件 | 代码位置 | 覆盖关系 |
+|-------|------|---------|---------|---------|
+| **1** | `reqBody.recurringEventId` | 请求中显式传递 | `createBooking.ts:222-224` | 被优先级 2 覆盖 |
+| **2** | `originalRescheduledBooking.recurringEventId` | 改期且原预约有系列 ID | `createBooking.ts:249-251` | 覆盖优先级 1 |
+| **3** | 默认值 `null` | 以上都不满足 | `createBooking.ts:206` | 不覆盖 |
+
+**关键代码顺序分析**：
+
+```typescript
+// 优先级 1：先检查请求参数
+if (reqBody.recurringEventId) {
+  newBookingData.recurringEventId = reqBody.recurringEventId;
+}
+
+// ... 中间代码 ...
+
+// 优先级 2：后检查原预约（可能覆盖优先级 1 的值）
+if (originalRescheduledBooking) {
+  // ...
+  
+  if (originalRescheduledBooking.recurringEventId) {
+    // 这里会覆盖之前设置的值！
+    newBookingData.recurringEventId = originalRescheduledBooking.recurringEventId;
+  }
+}
+```
+
+**这意味着**：如果改期的原预约有 `recurringEventId`，即使请求中显式传递了不同的 `recurringEventId`，最终也会使用原预约的值。
+
+---
+
+#### 4.6.3 原预约信息的获取机制
+
+`getOriginalRescheduledBooking` 函数负责查询原预约的完整信息：
+
+**位置**: `packages/features/bookings/repositories/BookingRepository.ts:1170-1217`
+
+```typescript
+async findOriginalRescheduledBooking(uid: string, seatsEventType?: boolean) {
+  return await this.prismaClient.booking.findFirst({
+    where: {
+      uid: uid,
+      status: {
+        in: [ACCEPTED, CANCELLED, PENDING],  // 可以改期的状态
+      },
+    },
+    // 关键：没有使用 select 限制字段
+    // 这意味着会返回 Booking 表的所有字段，包括：
+    // - recurringEventId
+    // - status, paid, metadata 等
+    include: {
+      attendees: { select: { ... } },
+      user: { select: { ... } },
+      eventType: { select: { ... } },
+      destinationCalendar: true,
+      payment: true,
+      references: true,
+    },
+  });
+}
+```
+
+**重要**：`findFirst` 没有使用 `select` 限制字段，所以 `recurringEventId` 会被自动包含在返回结果中。
+
+---
+
+#### 4.6.4 两条路径对比：站内改期 vs 外部日历回写改期
+
+改期有两条不同的触发路径，但最终落库逻辑是相同的。
+
+##### 路径 A：站内改期（用户在 Cal.diy UI 中操作）
+
+**数据流**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         站内改期数据流                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+用户在 UI 中点击"改期"
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 前端构建请求参数                                                              │
+│ {                                                                             │
+│   rescheduleUid: "abc123",      // 原预约 UID                                │
+│   start: "2024-01-16T14:00:00Z",                                            │
+│   end: "2024-01-16T14:30:00Z",                                              │
+│   eventTypeId: 123,                                                           │
+│   // 注意：不传递 recurringEventId！让后端决定                                │
+│ }                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ RegularBookingService.createBooking()                                        │
+│                                                                               │
+│ 1. 检测到 rescheduleUid 存在 → 是改期操作                                    │
+│                                                                               │
+│ 2. 调用 getOriginalRescheduledBooking("abc123")                             │
+│    返回：                                                                      │
+│    {                                                                          │
+│      uid: "abc123",                                                           │
+│      recurringEventId: "recur_xyz789",  // 原预约的系列 ID                   │
+│      status: "ACCEPTED",                                                      │
+│      // ... 其他字段                                                          │
+│    }                                                                          │
+│                                                                               │
+│ 3. buildNewBookingData()                                                      │
+│    - reqBody.recurringEventId: undefined（未传递）                           │
+│    - originalRescheduledBooking.recurringEventId: "recur_xyz789"（存在）    │
+│    → 最终 recurringEventId = "recur_xyz789"（继承）                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+【最终落库结果】
+
+原预约（uid: "abc123"）：
+┌─────────────────┬─────────────────┬─────────────────┐
+│     字段        │    原值         │    改期后       │
+├─────────────────┼─────────────────┼─────────────────┤
+│ uid             │ "abc123"        │ "abc123"        │
+│ recurringEventId│ "recur_xyz789"  │ "recur_xyz789"  │ ← 保持不变！
+│ status          │ "ACCEPTED"      │ "CANCELLED"     │
+│ rescheduled     │ false           │ true            │
+└─────────────────┴─────────────────┴─────────────────┘
+
+新预约（uid: "def456"）：
+┌─────────────────┬─────────────────┐
+│     字段        │      值         │
+├─────────────────┼─────────────────┤
+│ uid             │ "def456"        │
+│ recurringEventId│ "recur_xyz789"  │ ← 继承自原预约！
+│ fromReschedule  │ "abc123"        │ ← 关联原预约
+│ status          │ "ACCEPTED"      │
+│ rescheduled     │ false           │
+└─────────────────┴─────────────────┘
+```
+
+##### 路径 B：外部日历回写改期（用户在 Google/Apple 日历中修改）
+
+**数据流**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      外部日历回写改期数据流                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+用户在外部日历中修改事件时间
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CalendarSyncService.handleEvents()                                           │
+│                                                                               │
+│ 1. 过滤条件：只处理 iCalUID 以 "@cal.com" 结尾的事件                         │
+│    例如：iCalUID = "abc123@cal.com"                                          │
+│                                                                               │
+│ 2. 状态判断：                                                                  │
+│    - e.status === "cancelled" → 取消                                         │
+│    - 其他状态 && startTime 变化 → 改期                                        │
+│                                                                               │
+│ 3. 调用 this.rescheduleBooking(event, userId)                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CalendarSyncService.rescheduleBooking()                                      │
+│                                                                               │
+│ 1. 从 iCalUID 提取 bookingUid：                                              │
+│    const [bookingUid] = event.iCalUID?.split("@") ?? [undefined];           │
+│    → bookingUid = "abc123"                                                   │
+│                                                                               │
+│ 2. 构建改期数据：调用 buildRescheduleBookingData()                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ buildRescheduleBookingData(booking, event)                                   │
+│                                                                               │
+│ 返回：                                                                         │
+│ {                                                                             │
+│   eventTypeId: booking.eventTypeId,                                           │
+│   start: event.start?.toISOString(),                                          │
+│   end: calculatedEnd,                                                          │
+│   rescheduleUid: booking.uid,           // "abc123" ← 关键！                │
+│   // 注意：不传递 recurringEventId！                                           │
+│   // 让后续的 createBooking 逻辑决定继承                                       │
+│   idempotencyKey: "...",                                                      │
+│   responses: { ... },                                                          │
+│ }                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ regularBookingService.createBooking()                                         │
+│                                                                               │
+│ 关键参数：                                                                     │
+│ bookingMeta: {                                                                │
+│   skipCalendarSyncTaskCreation: true,  // 防止回环！                          │
+│   skipAvailabilityCheck: true,                                                │
+│   skipEventLimitsCheck: true,                                                 │
+│ }                                                                             │
+│                                                                               │
+│ 后续流程与站内改期完全相同：                                                   │
+│ 1. 检测到 rescheduleUid → 是改期                                             │
+│ 2. getOriginalRescheduledBooking() → 获取原预约信息                           │
+│ 3. buildNewBookingData() → 继承 recurringEventId                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+【最终落库结果】
+
+与站内改期**完全相同**！
+
+原预约（uid: "abc123"）：
+┌─────────────────┬─────────────────┐
+│ recurringEventId│ "recur_xyz789"  │ ← 保持不变
+│ status          │ "CANCELLED"     │
+│ rescheduled     │ true            │
+└─────────────────┴─────────────────┘
+
+新预约（uid: "def456"）：
+┌─────────────────┬─────────────────┐
+│ recurringEventId│ "recur_xyz789"  │ ← 继承自原预约！
+│ fromReschedule  │ "abc123"        │
+│ status          │ "ACCEPTED"      │
+└─────────────────┴─────────────────┘
+```
+
+---
+
+#### 4.6.5 两条路径的关键差异与相同点
+
+| 对比项 | 站内改期 | 外部日历回写改期 |
+|-------|---------|-----------------|
+| **触发入口** | UI → API → RegularBookingService | 外部日历 Webhook/轮询 → CalendarSyncService |
+| **rescheduleUid 来源** | 前端显式传递 | 从 iCalUID 解析（`{uid}@cal.com`） |
+| **skipCalendarSyncTaskCreation** | `false`（默认） | `true`（防止回环） |
+| **getOriginalRescheduledBooking** | 调用 | 调用 |
+| **buildNewBookingData 继承逻辑** | 相同 | 相同 |
+| **最终落库结果** | 相同 | 相同 |
+| **原预约 recurringEventId** | 保持不变 | 保持不变 |
+| **新预约 recurringEventId** | 继承原预约 | 继承原预约 |
+
+---
+
+#### 4.6.6 特殊场景：改期的改期（链式改期）
+
+如果一个已经改期过的预约再次被改期，会发生什么？
+
+```
+【场景】
+
+原始预约 A：
+- uid: "aaa111"
+- recurringEventId: "recur_xyz789"
+- status: ACCEPTED
+
+第一次改期 → 预约 B：
+- uid: "bbb222"
+- recurringEventId: "recur_xyz789" （继承自 A）
+- fromReschedule: "aaa111"
+- status: ACCEPTED
+
+预约 A 更新为：
+- status: CANCELLED
+- rescheduled: true
+
+第二次改期（改期预约 B）→ 预约 C：
+- uid: "ccc333"
+- recurringEventId: ???
+```
+
+**数据流**：
+
+```
+1. 用户改期预约 B（uid: "bbb222"）
+
+2. getOriginalRescheduledBooking("bbb222") 返回：
+   {
+     uid: "bbb222",
+     recurringEventId: "recur_xyz789",  // 这个值还在！
+     fromReschedule: "aaa111",
+     status: "ACCEPTED",
+     // ...
+   }
+
+3. buildNewBookingData()：
+   - originalRescheduledBooking.recurringEventId = "recur_xyz789"（存在）
+   → 新预约 C 的 recurringEventId = "recur_xyz789"
+```
+
+**最终结果**：
+
+```
+预约 A：
+- status: CANCELLED
+- rescheduled: true
+- recurringEventId: "recur_xyz789"
+
+预约 B：
+- status: CANCELLED
+- rescheduled: true
+- recurringEventId: "recur_xyz789"
+
+预约 C（最新）：
+- status: ACCEPTED
+- fromReschedule: "bbb222"
+- recurringEventId: "recur_xyz789"  ← 始终保持相同的系列 ID！
+```
+
+**结论**：无论改期多少次，所有预约（包括已取消的历史预约）都保持相同的 `recurringEventId`，这确保了系列的完整性。
+
+---
+
+#### 4.6.7 系列归属查询示例
+
+通过 `recurringEventId` 可以查询同一系列的所有预约，包括历史改期记录：
+
+```typescript
+// 查询同一系列的所有预约（包括已改期/已取消的）
+const allBookingsInSeries = await prisma.booking.findMany({
+  where: {
+    recurringEventId: "recur_xyz789",
+  },
+  orderBy: { startTime: 'asc' },
+});
+
+// 结果示例：
+[
+  { uid: "aaa111", status: "CANCELLED", rescheduled: true, startTime: "2024-01-15T10:00:00Z" },
+  { uid: "bbb222", status: "CANCELLED", rescheduled: true, startTime: "2024-01-16T14:00:00Z" },
+  { uid: "ccc333", status: "ACCEPTED",  rescheduled: false, startTime: "2024-01-17T16:00:00Z" },
+  // ... 同一系列的其他预约
+]
+
+// 只查询当前有效的预约
+const activeBookings = allBookingsInSeries.filter(b => 
+  b.status === "ACCEPTED" && !b.rescheduled
+);
+```
+
+---
+
+#### 4.6.8 代码位置索引（改期相关）
+
+| 功能 | 文件位置 |
+|------|----------|
+| 改期参数校验 | `packages/features/bookings/lib/service/RegularBookingService.ts:435-465` |
+| 获取原预约信息 | `packages/features/bookings/lib/handleNewBooking/originalRescheduledBookingUtils.ts:7-21` |
+| 原预约数据库查询 | `packages/features/bookings/repositories/BookingRepository.ts:1170-1217` |
+| 系列标识继承逻辑 | `packages/features/bookings/lib/handleNewBooking/createBooking.ts:168-271` |
+| 外部日历回写改期 | `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts:154-235` |
+| 构建回写改期数据 | `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts:247-274` |
+
+---
+
 ## 五、关键数据关联图
 
 ```
@@ -968,7 +1451,9 @@ public async reschedule(
 | 重复预约创建服务 | `packages/features/bookings/lib/service/RecurringBookingService.ts` |
 | 普通预约创建服务 | `packages/features/bookings/lib/service/RegularBookingService.ts` |
 | 取消预约逻辑 | `packages/features/bookings/lib/handleCancelBooking.ts` |
+| 创建/改期预约逻辑 | `packages/features/bookings/lib/handleNewBooking/createBooking.ts` |
 | 外部日历同步管理 | `packages/features/bookings/lib/EventManager.ts` |
+| 外部日历回写同步 | `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts` |
 | 前端创建 Hook | `packages/platform/atoms/hooks/bookings/useCreateRecurringBooking.ts` |
 | 前端取消 Hook | `packages/platform/atoms/hooks/bookings/useCancelBooking.ts` |
 | 取消输入类型 | `packages/platform/types/bookings/2024-08-13/inputs/cancel-booking.input.ts` |
@@ -981,8 +1466,18 @@ public async reschedule(
 
 2. **第三方重复事件 ID**：`thirdPartyRecurringEventId` 仅在第一个成功创建的外部日历事件中获取，后续 slot 复用此 ID
 
-3. **日历同步循环防护**：取消操作中有 `skipCalendarSyncTaskCancellation` 参数，用于防止外部日历 Webhook 触发的取消操作再次同步回外部日历（无限循环）
+3. **日历同步循环防护**：
+   - `skipCalendarSyncTaskCancellation`：外部日历回写取消时使用，防止无限循环
+   - `skipCalendarSyncTaskCreation`：外部日历回写改期时使用，防止无限循环
 
-4. **iCalSequence**：每次修改/取消预约时递增，用于 iCalendar 协议的版本控制
+4. **iCalUID 格式**：Cal.diy 创建的事件使用 `{booking-uid}@cal.com` 格式，外部日历回写时通过此后缀识别
 
-5. **座位预约与重复预约**：代码中有限制 `eventType.seatsPerTimeSlot && eventType.recurringEvent` 会抛出错误，即座位预约不支持重复
+5. **iCalSequence**：每次修改/取消预约时递增，用于 iCalendar 协议的版本控制
+
+6. **座位预约与重复预约**：代码中有限制 `eventType.seatsPerTimeSlot && eventType.recurringEvent` 会抛出错误，即座位预约不支持重复
+
+7. **改期后系列标识继承**：默认情况下，改期会自动继承原预约的 `recurringEventId`，保持系列关联
+
+8. **外部日历改期触发条件**：只有当 `startTime` 发生变化时才会触发改期，仅修改标题/描述等不会触发
+
+9. **权限检查**：外部日历回写时会验证 `booking.userId === calendarUserId`，确保日历所有者是预约组织者
