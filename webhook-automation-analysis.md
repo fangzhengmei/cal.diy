@@ -1501,3 +1501,1333 @@ export async function handleWebhookScheduledTriggers(prisma: PrismaClient) {
 │  │           Zapier              │    │            Make                 │ │
 │  │  ┌─────────────────────────┐  │    │  ┌─────────────────────────┐  │ │
 │  │  │ 鉴权方式:               │  │    │  │ 鉴权方式:               │  │ │
+│  │  │ - OAuth 2.0            │  │    │  │ - 仅 API Key             │  │ │
+│  │  │ - API Key (可选)       │  │    │  │ - 无 OAuth 支持         │  │ │
+│  │  │                        │  │    │  │                         │  │ │
+│  │  └─────────────────────────┘  │    │  └─────────────────────────┘  │ │
+│  │                               │    │                               │  │
+│  │  ┌─────────────────────────┐  │    │  ┌─────────────────────────┐  │ │
+│  │  │ 订阅管理:               │  │    │  │ 订阅管理:               │  │ │
+│  │  │ - validateAccountOrApi- │  │    │  │ - findValidApiKey()    │  │ │
+│  │  │   Key() 双模式处理      │  │    │  │ - 直接调用               │  │ │
+│  │  │                        │  │    │  │                         │  │ │
+│  │  └─────────────────────────┘  │    │  └─────────────────────────┘  │ │
+│  │                               │    │                               │  │
+│  │  ┌─────────────────────────┐  │    │  ┌─────────────────────────┐  │ │
+│  │  │ 投递链路:               │  │    │  │ 投递链路:               │  │ │
+│  │  │ - getZapierPayload()   │  │    │  │ - 标准 payload 格式    │  │ │
+│  │  │   自定义精简格式        │  │    │  │ - 无特殊处理           │  │ │
+│  │  │                        │  │    │  │                         │  │ │
+│  │  └─────────────────────────┘  │    │  └─────────────────────────┘  │ │
+│  └───────────────────────────────┘    └───────────────────────────────┘ │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 鉴权方式差异
+
+#### 5.2.1 Zapier: OAuth 2.0 + API Key 双模式
+
+Zapier 支持两种鉴权方式，通过 `validateAccountOrApiKey` 函数统一处理：
+
+**核心代码** (`packages/app-store/zapier/lib/validateAccountOrApiKey.ts`):
+
+```typescript
+export async function validateAccountOrApiKey(req: NextApiRequest, requiredScopes: string[] = []) {
+  const apiKey = req.query.apiKey as string;
+
+  if (!apiKey) {
+    // OAuth 2.0 模式: 从 Authorization header 获取 Bearer token
+    const token = req.headers.authorization?.split(" ")[1] || "";
+    const authorizedAccount = await isAuthorized(token, requiredScopes);
+    if (!authorizedAccount) throw new HttpError({ statusCode: 401, message: "Unauthorized" });
+    return { account: authorizedAccount, appApiKey: undefined };
+  }
+
+  // API Key 模式: 从 query 参数获取
+  const validKey = await findValidApiKey(apiKey, "zapier");
+  if (!validKey) throw new HttpError({ statusCode: 401, message: "API key not valid" });
+  return { account: null, appApiKey: validKey };
+}
+```
+
+**鉴权流程**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Zapier 鉴权流程                                        │
+│                                                                           │
+│  1. 检查 req.query.apiKey 是否存在                                         │
+│       │                                                                   │
+│       ├── 不存在 → OAuth 2.0 模式                                        │
+│       │        │                                                          │
+│       │        ▼                                                          │
+│       │   从 Authorization header 获取 Bearer token                       │
+│       │        │                                                          │
+│       │        ▼                                                          │
+│       │   isAuthorized(token, requiredScopes)                            │
+│       │        │                                                          │
+│       │        ├── 成功 → return { account, appApiKey: undefined }       │
+│       │        │                                                          │
+│       │        └── 失败 → throw HttpError(401)                          │
+│       │                                                                   │
+│       └── 存在 → API Key 模式                                             │
+│                │                                                          │
+│                ▼                                                          │
+│           findValidApiKey(apiKey, "zapier")                               │
+│                │                                                          │
+│                ├── 成功 → return { account: null, appApiKey }            │
+│                │                                                          │
+│                └── 失败 → throw HttpError(401)                          │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.2.2 Make: 仅 API Key 模式
+
+Make 只支持 API Key 鉴权，不支持 OAuth 2.0：
+
+**核心代码** (`packages/app-store/make/api/subscriptions/addSubscription.ts`):
+
+```typescript
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const apiKey = req.query.apiKey as string;
+
+  // 必须提供 apiKey，无 OAuth 回退
+  if (!apiKey) {
+    return res.status(401).json({ message: "No API key provided" });
+  }
+
+  // 直接验证 API Key
+  const validKey = await findValidApiKey(apiKey, "make");
+
+  if (!validKey) {
+    return res.status(401).json({ message: "API key not valid" });
+  }
+
+  // 继续处理订阅...
+}
+```
+
+**鉴权流程**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Make 鉴权流程                                          │
+│                                                                           │
+│  1. 检查 req.query.apiKey 是否存在                                         │
+│       │                                                                   │
+│       ├── 不存在 → 直接返回 401 (无 OAuth 回退)                          │
+│       │        │                                                          │
+│       │        ▼                                                          │
+│       │   return res.status(401).json({                                  │
+│       │     message: "No API key provided"                                │
+│       │   })                                                              │
+│       │                                                                   │
+│       └── 存在 → 验证 API Key                                             │
+│                │                                                          │
+│                ▼                                                          │
+│           findValidApiKey(apiKey, "make")                                 │
+│                │                                                          │
+│                ├── 成功 → 继续处理订阅                                    │
+│                │                                                          │
+│                └── 失败 → return res.status(401).json({                  │
+│                            message: "API key not valid"                   │
+│                          })                                               │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.2.3 OAuth 2.0 Token 验证机制 (Zapier 独有)
+
+Zapier 的 OAuth 2.0 模式使用 `isAuthorized` 函数验证 JWT token：
+
+**核心代码** (`packages/features/auth/lib/oAuthAuthorization.ts`):
+
+```typescript
+export default async function isAuthorized(token: string, requiredScopes: string[] = []) {
+  let decodedToken: OAuthTokenPayload;
+  try {
+    decodedToken = jwt.verify(token, process.env.CALENDSO_ENCRYPTION_KEY || "") as OAuthTokenPayload;
+  } catch {
+    return null;
+  }
+
+  if (!decodedToken) return null;
+  
+  // 检查所需 scope
+  const hasAllRequiredScopes = requiredScopes.every((scope) => decodedToken.scope.includes(scope));
+
+  // 验证 token 类型
+  if (!hasAllRequiredScopes || decodedToken.token_type !== "Access Token") {
+    return null;
+  }
+
+  // 用户级 token
+  if (decodedToken.userId) {
+    const user = await prisma.user.findUnique({
+      where: { id: decodedToken.userId },
+      select: { id: true, username: true },
+    });
+    if (!user) return null;
+    return { id: user.id, name: user.username, isTeam: false };
+  }
+
+  // 团队级 token
+  if (decodedToken.teamId) {
+    const team = await prisma.team.findUnique({
+      where: { id: decodedToken.teamId },
+      select: { id: true, name: true },
+    });
+    if (!team) return null;
+    return { ...team, isTeam: true };
+  }
+
+  return null;
+}
+```
+
+**OAuth Token 验证流程**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    OAuth 2.0 Token 验证流程 (Zapier 独有)                │
+│                                                                           │
+│  1. 从 Authorization: Bearer <token> 获取 token                          │
+│            │                                                              │
+│            ▼                                                              │
+│  2. JWT 验证 (jwt.verify)                                                 │
+│            │                                                              │
+│            ├── 失败 (签名错误/过期) → return null                        │
+│            │                                                              │
+│            ▼ (成功)                                                       │
+│  3. 检查 token_type === "Access Token"                                    │
+│            │                                                              │
+│            ├── 不匹配 → return null                                       │
+│            │                                                              │
+│            ▼ (匹配)                                                       │
+│  4. 检查 requiredScopes (如 ["READ_BOOKING", "READ_PROFILE"])            │
+│            │                                                              │
+│            ├── 缺少任一 scope → return null                               │
+│            │                                                              │
+│            ▼ (全部满足)                                                   │
+│  5. 判断 token 类型                                                        │
+│            │                                                              │
+│            ├── userId 存在 → 用户级 token                                │
+│            │        │                                                     │
+│            │        ▼                                                     │
+│            │   查询 prisma.user.findUnique({ id: userId })              │
+│            │        │                                                     │
+│            │        ├── 不存在 → return null                              │
+│            │        │                                                     │
+│            │        └── 存在 → return { id, name, isTeam: false }       │
+│            │                                                              │
+│            └── teamId 存在 → 团队级 token                                │
+│                     │                                                      │
+│                     ▼                                                      │
+│                查询 prisma.team.findUnique({ id: teamId })               │
+│                     │                                                      │
+│                     ├── 不存在 → return null                               │
+│                     │                                                      │
+│                     └── 存在 → return { id, name, isTeam: true }         │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+**OAuth Token 与 API Key 鉴权结果差异**:
+
+| 鉴权方式 | 返回值结构 | 使用场景 |
+|---------|-----------|---------|
+| **OAuth 2.0** | `{ account: { id, name, isTeam }, appApiKey: undefined }` | 支持用户/团队区分，可传递给 `addSubscription` 的 `account` 参数 |
+| **API Key** | `{ account: null, appApiKey: ApiKey }` | 直接使用 `appApiKey.userId` 或 `appApiKey.teamId` |
+
+**Token Payload 结构** (`OAuthTokenPayload`):
+```typescript
+{
+  userId?: number;      // 用户级 token
+  teamId?: number;      // 团队级 token
+  scope: string[];      // 权限范围 (如 ["READ_BOOKING", "READ_PROFILE"])
+  token_type: string;   // 必须为 "Access Token"
+  // ... 其他 JWT 标准字段 (exp, iat 等)
+}
+```
+
+#### 5.2.4 API Key 验证机制 (共享)
+
+两种工具使用相同的 `findValidApiKey` 函数验证 API Key：
+
+**核心代码** (`packages/app-store/_utils/findValidApiKey.ts`):
+
+```typescript
+function hashAPIKey(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex");
+}
+
+export async function findValidApiKey(apiKey: string, appId: string): Promise<ApiKey | null> {
+  const hashedKey = hashAPIKey(apiKey);
+
+  return prisma.apiKey.findFirst({
+    where: {
+      hashedKey,
+      appId,  // 验证 appId 匹配 (zapier 或 make)
+      OR: [{ expiresAt: null }, { expiresAt: { gte: new Date() } }],  // 未过期
+    },
+  });
+}
+```
+
+**验证条件**:
+1. **SHA256 哈希匹配**: 存储的是哈希值，不是明文
+2. **appId 匹配**: 验证 API Key 是否属于该应用
+3. **未过期**: `expiresAt` 为 null 或大于当前时间
+
+#### 5.2.5 鉴权方式对比总结
+
+| 特性 | Zapier | Make |
+|------|--------|------|
+| **OAuth 2.0 支持** | ✅ 支持 (Authorization header) | ❌ 不支持 |
+| **API Key 支持** | ✅ 支持 (query 参数) | ✅ 支持 (query 参数) |
+| **鉴权函数** | `validateAccountOrApiKey()` | 直接调用 `findValidApiKey()` |
+| **OAuth 回退** | ✅ 无 apiKey 时使用 OAuth | ❌ 无 apiKey 时直接 401 |
+| **appId 验证** | `appId: "zapier"` | `appId: "make"` |
+
+---
+
+### 5.3 订阅管理接口差异
+
+#### 5.3.1 接口概览
+
+两种工具的订阅管理接口位于：
+
+| 工具 | 接口路径 |
+|------|---------|
+| **Zapier** | `packages/app-store/zapier/api/subscriptions/` |
+| **Make** | `packages/app-store/make/api/subscriptions/` |
+
+**可用接口**:
+
+| 接口 | Zapier | Make |
+|------|--------|------|
+| `addSubscription` (POST) | ✅ | ✅ |
+| `deleteSubscription` (DELETE) | ✅ | ✅ |
+| `listBookings` (GET) | ✅ | ✅ |
+| `me` (GET) | ✅ | ✅ |
+| `listOOOEntries` (GET) | ✅ | ❌ |
+
+**注意**: Zapier 有额外的 `listOOOEntries` 接口，用于获取外出状态列表。
+
+#### 5.3.2 底层实现复用
+
+两种工具**共享相同的底层实现** (`packages/features/webhooks/lib/scheduleTrigger.ts`):
+
+- **`addSubscription`**: 创建新订阅
+- **`deleteSubscription`**: 删除订阅
+- **`scheduleTrigger`**: 为定时事件创建触发记录
+- **`deleteWebhookScheduledTriggers`**: 删除定时触发记录
+
+#### 5.3.3 添加订阅接口对比
+
+**Zapier - addSubscription**:
+
+```typescript
+// packages/app-store/zapier/api/subscriptions/addSubscription.ts
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { subscriberUrl, triggerEvent } = req.body;
+  
+  // 使用双模式鉴权
+  const { account, appApiKey } = await validateAccountOrApiKey(req, ["READ_BOOKING", "READ_PROFILE"]);
+  
+  // 调用底层实现
+  const createAppSubscription = await addSubscription({
+    appApiKey,
+    account,           // OAuth 模式时提供
+    triggerEvent,
+    subscriberUrl,
+    appId: "zapier",
+  });
+
+  // ...
+}
+```
+
+**Make - addSubscription**:
+
+```typescript
+// packages/app-store/make/api/subscriptions/addSubscription.ts
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const apiKey = req.query.apiKey as string;
+  
+  // 仅 API Key 模式，无 OAuth
+  if (!apiKey) {
+    return res.status(401).json({ message: "No API key provided" });
+  }
+
+  const validKey = await findValidApiKey(apiKey, "make");
+  
+  if (!validKey) {
+    return res.status(401).json({ message: "API key not valid" });
+  }
+
+  const { subscriberUrl, triggerEvent } = req.body;
+
+  // 调用底层实现 (无 account 参数)
+  const createAppSubscription = await addSubscription({
+    appApiKey: validKey,
+    // account: undefined (不支持 OAuth)
+    triggerEvent,
+    subscriberUrl,
+    appId: "make",
+  });
+
+  // ...
+}
+```
+
+#### 5.3.4 删除订阅接口对比
+
+**Zapier - deleteSubscription**:
+
+```typescript
+// packages/app-store/zapier/api/subscriptions/deleteSubscription.ts
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { id } = querySchema.parse(req.query);
+
+  // 双模式鉴权
+  const { account, appApiKey } = await validateAccountOrApiKey(req, ["READ_BOOKING", "READ_PROFILE"]);
+
+  const deleteEventSubscription = await deleteSubscription({
+    appApiKey,
+    account,
+    webhookId: id,
+    appId: "zapier",
+  });
+
+  // ...
+}
+```
+
+**Make - deleteSubscription**:
+
+```typescript
+// packages/app-store/make/api/subscriptions/deleteSubscription.ts
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const { apiKey, id } = querySchema.parse(req.query);
+
+  // 仅 API Key 模式
+  if (!apiKey) {
+    return res.status(401).json({ message: "No API key provided" });
+  }
+
+  const validKey = await findValidApiKey(apiKey, "make");
+
+  if (!validKey) {
+    return res.status(401).json({ message: "API key not valid" });
+  }
+
+  const deleteEventSubscription = await deleteSubscription({
+    appApiKey: validKey,
+    // account: undefined
+    webhookId: id,
+    appId: "make",
+  });
+
+  // ...
+}
+```
+
+#### 5.3.5 底层 addSubscription 实现
+
+两种工具共享相同的底层实现：
+
+**核心代码** (`packages/features/webhooks/lib/scheduleTrigger.ts:30`):
+
+```typescript
+export async function addSubscription({
+  appApiKey,
+  triggerEvent,
+  subscriberUrl,
+  appId,
+  account,  // OAuth 模式时提供 (Zapier 特有)
+}: {
+  appApiKey?: ApiKey;
+  triggerEvent: WebhookTriggerEvents;
+  subscriberUrl: string;
+  appId: string;
+  account?: {
+    id: number;
+    name: string | null;
+    isTeam: boolean;
+  } | null;
+}) {
+  // 确定 userId 和 teamId
+  const userId = appApiKey ? appApiKey.userId : account && !account.isTeam ? account.id : null;
+  const teamId = appApiKey ? appApiKey.teamId : account && account.isTeam ? account.id : null;
+
+  // 创建 Webhook 记录
+  const createSubscription = await prisma.webhook.create({
+    data: {
+      id: v4(),
+      userId,
+      teamId,
+      eventTriggers: [triggerEvent],
+      subscriberUrl,
+      active: true,
+      appId: appId,  // "zapier" 或 "make"
+    },
+  });
+
+  // 对于定时事件 (MEETING_STARTED/ENDED)，为现有预订创建触发记录
+  if (
+    triggerEvent === WebhookTriggerEvents.MEETING_ENDED ||
+    triggerEvent === WebhookTriggerEvents.MEETING_STARTED
+  ) {
+    // 查询现有预订
+    const bookings = await prisma.booking.findMany({
+      where: {
+        ...where,
+        startTime: { gte: new Date() },
+        status: BookingStatus.ACCEPTED,
+      },
+      // ...
+    });
+
+    // 为每个预订创建触发记录
+    for (const booking of bookingsWithCalEventResponses) {
+      scheduleTrigger({
+        booking,
+        subscriberUrl: createSubscription.subscriberUrl,
+        subscriber: {
+          id: createSubscription.id,
+          appId: createSubscription.appId,
+        },
+        triggerEvent,
+      });
+    }
+  }
+
+  return createSubscription;
+}
+```
+
+#### 5.3.6 订阅管理接口对比总结
+
+| 特性 | Zapier | Make |
+|------|--------|------|
+| **底层实现** | 共享 `addSubscription` / `deleteSubscription` | 共享相同实现 |
+| **鉴权方式** | `validateAccountOrApiKey()` (双模式) | `findValidApiKey()` (仅 API Key) |
+| **account 参数** | ✅ 支持 (OAuth 模式) | ❌ 不支持 |
+| **listOOOEntries 接口** | ✅ 支持 | ❌ 不支持 |
+| **appId 标识** | `"zapier"` | `"make"` |
+
+---
+
+### 5.4 投递接入链路差异
+
+#### 5.4.1 相同的投递链路
+
+两种工具使用**完全相同的投递链路**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    共享的投递链路                                         │
+│                                                                           │
+│  事件触发                                                                  │
+│      │                                                                    │
+│      ▼                                                                    │
+│  WebhookTaskerProducerService.queueXxxWebhook()                          │
+│      │                                                                    │
+│      ▼                                                                    │
+│  Trigger.dev 任务队列                                                     │
+│      │                                                                    │
+│      ▼                                                                    │
+│  WebhookTaskConsumer.processWebhookTask()                                 │
+│      │                                                                    │
+│      ▼                                                                    │
+│  DataFetcher.fetchEventData()                                             │
+│      │                                                                    │
+│      ▼                                                                    │
+│  PayloadBuilder.build()                                                   │
+│      │                                                                    │
+│      ▼                                                                    │
+│  sendPayload()  ← 此处开始有差异                                          │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.4.2 差异点: Payload 格式
+
+**Zapier 有自定义的精简格式**，Make 使用标准格式。
+
+**核心代码** (`packages/features/webhooks/lib/sendPayload.ts:232`):
+
+```typescript
+/* Zapier id is hardcoded in the DB, we send the raw data for this case  */
+if (isEventPayload(data)) {
+  data.description = data.description || data.additionalNotes;
+  if (appId === "zapier") {
+    // Zapier: 使用自定义精简格式
+    body = getZapierPayload({ ...data, createdAt });
+  }
+}
+
+// 其他情况 (包括 Make): 使用标准格式
+if (body === undefined) {
+  if (
+    template &&
+    (isOOOEntryPayload(data) || isEventPayload(data) || isNoShowPayload(data))
+  ) {
+    // 自定义模板
+    body = applyTemplate(template, { ...data, triggerEvent, createdAt }, contentType);
+  } else {
+    // 标准格式
+    body = JSON.stringify({
+      triggerEvent: triggerEvent,
+      createdAt: createdAt,
+      payload: data,
+    });
+  }
+}
+```
+
+#### 5.4.3 Zapier 自定义 Payload 格式
+
+**核心代码** (`packages/features/webhooks/lib/sendPayload.ts:132`):
+
+```typescript
+function getZapierPayload(data: WithUTCOffsetType<EventPayloadType & { createdAt: string }>): string {
+  // 精简 attendees
+  const attendees = (data.attendees as (Person & UTCOffset)[]).map((attendee) => {
+    return {
+      name: attendee.name,
+      email: attendee.email,
+      timeZone: attendee.timeZone,
+      utcOffset: attendee.utcOffset,
+    };
+  });
+
+  // 获取可读的位置信息
+  const t = data.organizer.language.translate;
+  const location = getHumanReadableLocationValue(data.location || "", t);
+
+  // 构建精简格式
+  const body = {
+    uid: data.uid,
+    title: data.title,
+    description: data.description,
+    customInputs: data.customInputs,
+    responses: data.responses,
+    userFieldsResponses: data.userFieldsResponses,
+    startTime: data.startTime,
+    endTime: data.endTime,
+    location: location,
+    status: data.status,
+    cancellationReason: data.cancellationReason,
+    user: {
+      username: data.organizer.username,
+      usernameInOrg: data.organizer.usernameInOrg,
+      name: data.organizer.name,
+      email: data.organizer.email,
+      timeZone: data.organizer.timeZone,
+      utcOffset: data.organizer.utcOffset,
+      locale: data.organizer.locale,
+    },
+    eventType: {
+      title: data.eventTitle,
+      description: data.eventDescription,
+      requiresConfirmation: data.requiresConfirmation,
+      price: data.price,
+      currency: data.currency,
+      length: data.length,
+    },
+    attendees: attendees,
+    createdAt: data.createdAt,
+    metadata: {
+      videoCallUrl: data.metadata?.videoCallUrl,
+    },
+  };
+  
+  return JSON.stringify(body);
+}
+```
+
+#### 5.4.4 标准 Payload 格式 (Make 使用)
+
+```typescript
+// 标准格式 (sendPayload.ts:247)
+body = JSON.stringify({
+  triggerEvent: triggerEvent,    // 如 "BOOKING_CREATED"
+  createdAt: createdAt,           // ISO 时间戳
+  payload: data,                  // 完整的 EventPayloadType
+});
+```
+
+#### 5.4.5 Payload 格式对比
+
+**Zapier 格式示例**:
+
+```json
+{
+  "uid": "booking-uid-123",
+  "title": "Meeting with John",
+  "description": "Discuss project",
+  "startTime": "2024-01-15T10:00:00.000Z",
+  "endTime": "2024-01-15T10:30:00.000Z",
+  "location": "Zoom",
+  "status": "ACCEPTED",
+  "user": {
+    "username": "jane",
+    "name": "Jane Doe",
+    "email": "jane@example.com",
+    "timeZone": "America/New_York",
+    "utcOffset": -300
+  },
+  "attendees": [
+    {
+      "name": "John Smith",
+      "email": "john@example.com",
+      "timeZone": "Europe/London",
+      "utcOffset": 0
+    }
+  ],
+  "createdAt": "2024-01-14T15:30:00.000Z"
+}
+```
+
+**Make 格式示例 (标准格式)**:
+
+```json
+{
+  "triggerEvent": "BOOKING_CREATED",
+  "createdAt": "2024-01-14T15:30:00.000Z",
+  "payload": {
+    "uid": "booking-uid-123",
+    "title": "Meeting with John",
+    "description": "Discuss project",
+    "startTime": "2024-01-15T10:00:00.000Z",
+    "endTime": "2024-01-15T10:30:00.000Z",
+    "location": "Zoom",
+    "status": "ACCEPTED",
+    "organizer": {
+      "username": "jane",
+      "name": "Jane Doe",
+      "email": "jane@example.com",
+      "timeZone": "America/New_York"
+    },
+    "attendees": [
+      {
+        "name": "John Smith",
+        "email": "john@example.com",
+        "timeZone": "Europe/London",
+        "locale": "en",
+        "language": { /* ... */ }
+      }
+    ],
+    "eventType": {
+      "title": "30 Minute Meeting",
+      "description": "A 30 minute meeting",
+      "requiresConfirmation": false,
+      "price": 0,
+      "currency": "USD",
+      "length": 30
+    },
+    "metadata": {
+      "videoCallUrl": "https://zoom.us/j/123456"
+    },
+    "responses": { /* ... */ },
+    "customInputs": { /* ... */ },
+    "cancellationReason": null,
+    "bookingId": 123
+  }
+}
+```
+
+#### 5.4.6 投递链路对比总结
+
+| 特性 | Zapier | Make |
+|------|--------|------|
+| **投递链路** | 完全相同 | 完全相同 |
+| **Producer** | `WebhookTaskerProducerService` | 相同 |
+| **Consumer** | `WebhookTaskConsumer` | 相同 |
+| **签名验证** | HMAC-SHA256 (`X-Cal-Signature-256`) | 相同 |
+| **版本头** | `X-Cal-Webhook-Version` | 相同 |
+| **Payload 格式** | 自定义精简格式 (`getZapierPayload`) | 标准格式 |
+| **格式特点** | 扁平化、关键字段、`user` 而非 `organizer` | 完整嵌套、`triggerEvent` 外层、`organizer` 字段 |
+
+---
+
+### 5.5 完整对比总结
+
+#### 5.5.1 对比总表
+
+| 维度 | 特性 | Zapier | Make |
+|------|------|--------|------|
+| **鉴权方式** | OAuth 2.0 | ✅ 支持 | ❌ 不支持 |
+| | API Key | ✅ 支持 (query 参数) | ✅ 支持 (query 参数) |
+| | 鉴权函数 | `validateAccountOrApiKey()` | `findValidApiKey()` |
+| | OAuth 回退 | ✅ 无 apiKey 时使用 OAuth | ❌ 直接 401 |
+| | | | |
+| **订阅管理** | 底层实现 | 共享 `addSubscription` / `deleteSubscription` | 相同 |
+| | account 参数 | ✅ 支持 (OAuth 模式) | ❌ 不支持 |
+| | listOOOEntries | ✅ 支持 | ❌ 不支持 |
+| | appId | `"zapier"` | `"make"` |
+| | | | |
+| **投递链路** | Producer/Consumer | 完全相同 | 完全相同 |
+| | 签名验证 | HMAC-SHA256 | 相同 |
+| | 版本头 | `X-Cal-Webhook-Version` | 相同 |
+| | Payload 格式 | 自定义精简格式 | 标准格式 |
+| | 格式特点 | 扁平化、`user` 字段 | 嵌套、`triggerEvent` 外层、`organizer` 字段 |
+
+#### 5.5.2 架构差异图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Zapier vs Make 架构差异                                │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │                         Zapier 架构                                    │ │
+│  │                                                                       │ │
+│  │   ┌─────────────┐     ┌─────────────┐     ┌─────────────────────┐  │ │
+│  │   │ OAuth 2.0   │     │  API Key    │     │                     │  │ │
+│  │   │ (Bearer     │     │ (query)     │     │ validateAccount-    │  │ │
+│  │   │ token)      │     │             │     │ OrApiKey()          │  │ │
+│  │   └──────┬──────┘     └──────┬──────┘     │ (双模式统一处理)     │  │ │
+│  │          │                   │            └──────────┬──────────┘  │ │
+│  │          └─────────┬─────────┘                       │              │ │
+│  │                    ▼                                 ▼              │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              addSubscription / deleteSubscription      │    │ │
+│  │         │              (scheduleTrigger.ts 共享实现)             │    │ │
+│  │         └──────────────────────────┬──────────────────────────┘    │ │
+│  │                                    │                                 │ │
+│  │                                    ▼                                 │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              投递链路 (共享)                          │    │ │
+│  │         │  Producer → Trigger.dev → Consumer → sendPayload    │    │ │
+│  │         └──────────────────────────┬──────────────────────────┘    │ │
+│  │                                    │                                 │ │
+│  │                                    ▼                                 │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              getZapierPayload()                      │    │ │
+│  │         │              (自定义精简格式)                         │    │ │
+│  │         └─────────────────────────────────────────────────────┘    │ │
+│  │                                                                       │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │                          Make 架构                                    │ │
+│  │                                                                       │ │
+│  │   ┌─────────────┐                                                     │ │
+│  │   │  API Key    │                                                     │ │
+│  │   │ (query)     │                                                     │ │
+│  │   └──────┬──────┘                                                     │ │
+│  │          │                                                            │ │
+│  │          ▼                                                            │ │
+│  │   ┌─────────────────┐     ┌─────────────────────┐                   │ │
+│  │   │ findValidApiKey │     │                     │                   │ │
+│  │   │ (仅 API Key)    │     │ ❌ 无 OAuth 支持   │                   │ │
+│  │   └────────┬────────┘     └─────────────────────┘                   │ │
+│  │          │                                                             │ │
+│  │          ▼                                                             │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              addSubscription / deleteSubscription      │    │ │
+│  │         │              (scheduleTrigger.ts 共享实现)             │    │ │
+│  │         └──────────────────────────┬──────────────────────────┘    │ │
+│  │                                    │                                 │ │
+│  │                                    ▼                                 │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              投递链路 (共享)                          │    │ │
+│  │         │  Producer → Trigger.dev → Consumer → sendPayload    │    │ │
+│  │         └──────────────────────────┬──────────────────────────┘    │ │
+│  │                                    │                                 │ │
+│  │                                    ▼                                 │ │
+│  │         ┌─────────────────────────────────────────────────────┐    │ │
+│  │         │              标准 Payload 格式                       │    │ │
+│  │         │  { triggerEvent, createdAt, payload }                │    │ │
+│  │         └─────────────────────────────────────────────────────┘    │ │
+│  │                                                                       │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.5.3 关键代码位置汇总
+
+| 功能 | Zapier | Make | 共享 |
+|------|--------|------|------|
+| 鉴权函数 | `zapier/lib/validateAccountOrApiKey.ts` | - | `_utils/findValidApiKey.ts` |
+| 添加订阅 | `zapier/api/subscriptions/addSubscription.ts` | `make/api/subscriptions/addSubscription.ts` | `webhooks/lib/scheduleTrigger.ts` |
+| 删除订阅 | `zapier/api/subscriptions/deleteSubscription.ts` | `make/api/subscriptions/deleteSubscription.ts` | `webhooks/lib/scheduleTrigger.ts` |
+| Payload 格式 | - | - | `webhooks/lib/sendPayload.ts` (getZapierPayload) |
+
+---
+
+## 6. 关键文件位置
+
+### 6.1 核心 Webhook 系统
+
+| 功能 | 文件路径 |
+|------|---------|
+| Webhook 模型 | `packages/prisma/schema.prisma:1142` |
+| WebhookScheduledTriggers 模型 | `packages/prisma/schema.prisma:1313` |
+| 生产者服务 | `packages/features/webhooks/lib/service/WebhookTaskerProducerService.ts` |
+| 消费者服务 | `packages/features/webhooks/lib/service/WebhookTaskConsumer.ts` |
+| Webhook 服务 | `packages/features/webhooks/lib/service/WebhookService.ts` |
+| Payload 发送 | `packages/features/webhooks/lib/sendPayload.ts` |
+| 定时触发处理 | `packages/features/webhooks/lib/handleWebhookScheduledTriggers.ts` |
+| 订阅管理 | `packages/features/webhooks/lib/scheduleTrigger.ts` |
+| Trigger.dev 配置 | `packages/features/webhooks/lib/tasker/trigger/config.ts` |
+
+### 6.2 自动化工具集成
+
+| 功能 | Zapier | Make |
+|------|--------|------|
+| 鉴权函数 | `packages/app-store/zapier/lib/validateAccountOrApiKey.ts` | 无 (直接使用 findValidApiKey) |
+| 添加订阅 | `packages/app-store/zapier/api/subscriptions/addSubscription.ts` | `packages/app-store/make/api/subscriptions/addSubscription.ts` |
+| 删除订阅 | `packages/app-store/zapier/api/subscriptions/deleteSubscription.ts` | `packages/app-store/make/api/subscriptions/deleteSubscription.ts` |
+| API Key 验证 | `packages/app-store/_utils/findValidApiKey.ts` | 相同 |
+
+---
+
+## 7. 数据流图
+
+### 7.1 即时事件数据流 (BOOKING_CREATED 等)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    即时事件数据流                                          │
+│                                                                           │
+│  ┌─────────────┐                                                         │
+│  │   事件源    │  (预订创建/取消/重新安排等)                              │
+│  │  Booking/  │                                                         │
+│  │   Form/    │                                                         │
+│  │  Recording  │                                                         │
+│  └──────┬──────┘                                                         │
+│         │                                                                │
+│         ▼                                                                │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              WebhookTaskerProducerService                          │  │
+│  │  - 轻量级入队                                                        │  │
+│  │  - 构建最小化 payload (仅 bookingUid 等关键字段)                    │  │
+│  │  - 调用 webhookTasker.deliverWebhook()                             │  │
+│  └──────────────────────────────┬────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    Trigger.dev 任务队列                             │  │
+│  │  - 队列名: webhook-delivery                                         │  │
+│  │  - 并发限制: 25                                                      │  │
+│  │  - 重试配置: maxAttempts=3, 指数退避                               │  │
+│  └──────────────────────────────┬────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                   WebhookTaskConsumer                               │  │
+│  │  1. 获取 DataFetcher (根据 triggerEvent)                            │  │
+│  │  2. 获取订阅者上下文                                                 │  │
+│  │  3. 查询订阅者 (webhookRepository.getSubscribers)                  │  │
+│  │  4. 获取事件数据 (fetcher.fetchEventData)                           │  │
+│  │  5. 构建 DTO 和 Payload                                              │  │
+│  │  6. 调用 webhookService.processWebhooks()                           │  │
+│  └──────────────────────────────┬────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    WebhookService.processWebhooks()                 │  │
+│  │  - 对每个订阅者并行发送 (Promise.allSettled)                        │  │
+│  │  - 单个订阅者失败不影响其他订阅者                                    │  │
+│  │  - 统计成功/失败数量                                                 │  │
+│  │  - 记录详细日志                                                      │  │
+│  └──────────────────────────────┬────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                       sendPayload()                                  │  │
+│  │  - 构建 body (Zapier: getZapierPayload, 其他: 标准格式)           │  │
+│  │  - 计算 HMAC-SHA256 签名                                            │  │
+│  │  - 发送 POST 请求                                                   │  │
+│  │  - 返回 { ok, status }                                              │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 定时事件数据流 (MEETING_STARTED 等)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    定时事件数据流                                          │
+│                                                                           │
+│  ┌─────────────┐                                                         │
+│  │ 创建订阅时 │                                                         │
+│  │  (add-    │                                                         │
+│  │  Subscription) │                                                     │
+│  └──────┬──────┘                                                         │
+│         │                                                                │
+│         ▼                                                                │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              scheduleTrigger() (scheduleTrigger.ts)                 │  │
+│  │  - 为每个现有预订创建 WebhookScheduledTriggers 记录                 │  │
+│  │  - 计算 startAfter = booking.startTime 或 endTime                   │  │
+│  │  - 序列化 payload 到数据库                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              WebhookScheduledTriggers 表                           │  │
+│  │  - subscriberUrl: 目标 URL                                          │  │
+│  │  - payload: 序列化的任务数据                                        │  │
+│  │  - startAfter: 触发时间                                             │  │
+│  │  - webhookId: 关联的 webhook                                        │  │
+│  │  - bookingId: 关联的预订                                            │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              Cron 定时任务 (每小时/每分钟)                          │  │
+│  │  - 调用 handleWebhookScheduledTriggers()                            │  │
+│  └──────────────────────────────┬────────────────────────────────────┘  │
+│                                 │                                        │
+│                                 ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │         handleWebhookScheduledTriggers()                           │  │
+│  │  1. 清理过期任务 (超过 1 天)                                        │  │
+│  │  2. 查询到期任务 (startAfter <= now)                                │  │
+│  │  3. 构建请求 (签名、版本头)                                          │  │
+│  │  4. 发送 fetch 请求 (Promise.allSettled)                           │  │
+│  │  5. **立即删除任务记录** (无论成功失败)                             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ⚠️ 注意: 定时触发无重试机制，失败后立即删除任务记录                      │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 8. 版本控制
+
+### 8.1 Webhook 版本
+
+**版本字段**: `Webhook.version` (默认: `"2021-10-20"`)
+
+**HTTP 头**: `X-Cal-Webhook-Version`
+
+### 8.2 Payload 版本化
+
+通过 `PayloadBuilderFactory` 管理不同版本的 payload 格式：
+
+```typescript
+// 获取版本化的 builder
+builder = payloadBuilderFactory.getBuilder(version, triggerEvent)
+
+// 构建 payload
+webhookPayload = builder.build(dto)
+```
+
+---
+
+## 9. 安全考虑
+
+### 9.1 SSRF 保护
+
+**位置**: `packages/trpc/server/routers/viewer/webhook/create.handler.ts`
+
+```typescript
+// 创建订阅时验证
+const validation = validateUrlForSSRFSync(input.subscriberUrl);
+if (!validation.isValid) {
+  throw new TRPCError({
+    code: "BAD_REQUEST",
+    message: `Webhook URL is not allowed: ${validation.error}`,
+  });
+}
+```
+
+**禁止的地址**:
+- 内网 IP: `127.0.0.1`, `192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`
+- `localhost`
+- 私有/保留地址范围
+
+### 9.2 HMAC-SHA256 签名验证
+
+**位置**: `packages/features/webhooks/lib/sendPayload.ts`
+
+```typescript
+// 构建签名
+export const createWebhookSignature = (params: { secret?: string | null; body: string }) =>
+  params.secret
+    ? createHmac("sha256", params.secret).update(`${params.body}`).digest("hex")
+    : "no-secret-provided";
+
+// HTTP 头
+headers: {
+  "X-Cal-Signature-256": signature,
+}
+```
+
+**验证方应该**:
+1. 从 `X-Cal-Signature-256` 获取签名
+2. 使用相同的 secret 和 body 计算 HMAC-SHA256
+3. 比较签名是否匹配
+
+### 9.3 重定向保护
+
+**位置**: `packages/features/webhooks/lib/sendPayload.ts:312`
+
+```typescript
+fetch(subscriberUrl, {
+  method: "POST",
+  headers: { /* ... */ },
+  redirect: "manual",  // 禁止重定向
+  body,
+})
+```
+
+**原因**: 防止 SSRF 通过重定向访问内网
+
+### 9.4 API Key 安全
+
+**位置**: `packages/app-store/_utils/findValidApiKey.ts`
+
+```typescript
+function hashAPIKey(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex");
+}
+```
+
+**安全措施**:
+- 存储 SHA256 哈希，不是明文
+- 验证时哈希比较
+- 检查 `expiresAt` 过期时间
+- 检查 `appId` 匹配
+
+---
+
+## 10. 监控与日志
+
+### 10.1 日志体系
+
+系统实现了**完整的日志闭环**，使用结构化日志：
+
+```typescript
+// 生产者入队
+this.log.debug("Queueing booking webhook task", { operationId, triggerEvent, bookingUid });
+this.log.debug("Webhook delivery task queued", { operationId, taskId });
+
+// 消费者处理
+this.log.debug("Processing webhook delivery task", { operationId, taskId, triggerEvent });
+this.log.debug(`Found ${subscribers.length} webhook subscriber(s)`, { operationId });
+this.log.warn("Event data not found", { operationId, triggerEvent });
+
+// 投递结果
+this.log.debug("Webhook sent successfully", { trigger, webhookId, statusCode });
+this.log.error("Webhook failed", { error, trigger, webhookId, statusCode });
+
+// 汇总统计
+this.log.info(`Webhook processing completed for ${trigger}`, {
+  totalSubscribers,
+  successful: successCount,
+  failed: failureCount,
+});
+```
+
+### 10.2 日志级别
+
+| 级别 | 使用场景 |
+|------|---------|
+| `debug` | 详细追踪信息 (入队、处理、发送) |
+| `info` | 汇总统计 (处理完成) |
+| `warn` | 可恢复的问题 (数据不存在) |
+| `error` | 失败情况 (HTTP 非 2xx、异常) |
+
+### 10.3 日志字段
+
+每个日志条目包含：
+- `operationId`: 操作追踪 ID (UUID)
+- `taskId`: Trigger.dev 任务 ID
+- `triggerEvent`: 触发事件类型
+- `webhookId`: Webhook ID
+- `subscriberUrl`: 目标 URL
+- `statusCode`: HTTP 状态码
+- `error`: 错误信息
+
+---
+
+## 11. 扩展指南
+
+### 11.1 添加新的自动化工具集成
+
+#### 步骤 1: 创建应用目录
+
+```
+packages/app-store/{tool-name}/
+├── _metadata.ts (或 config.json)
+├── lib/
+│   └── validateAccountOrApiKey.ts (如需要)
+└── api/
+    └── subscriptions/
+        ├── addSubscription.ts
+        ├── deleteSubscription.ts
+        ├── listBookings.ts
+        └── me.ts
+```
+
+#### 步骤 2: 实现鉴权
+
+参考 Zapier 或 Make 的实现：
+
+```typescript
+// 简单版本 (仅 API Key)
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const apiKey = req.query.apiKey as string;
+  
+  if (!apiKey) {
+    return res.status(401).json({ message: "No API key provided" });
+  }
+
+  const validKey = await findValidApiKey(apiKey, "your-tool-name");
+  
+  if (!validKey) {
+    return res.status(401).json({ message: "API key not valid" });
+  }
+
+  // 继续处理...
+}
+```
+
+#### 步骤 3: 实现订阅管理接口
+
+复用 `scheduleTrigger.ts` 中的底层实现：
+
+```typescript
+import { addSubscription, deleteSubscription } from "@calcom/features/webhooks/lib/scheduleTrigger";
+
+// 添加订阅
+const createAppSubscription = await addSubscription({
+  appApiKey: validKey,
+  triggerEvent,
+  subscriberUrl,
+  appId: "your-tool-name",
+});
+
+// 删除订阅
+const deleteEventSubscription = await deleteSubscription({
+  appApiKey: validKey,
+  webhookId: id,
+  appId: "your-tool-name",
+});
+```
+
+#### 步骤 4: (可选) 自定义 Payload 格式
+
+修改 `sendPayload.ts` 中的 `getZapierPayload` 逻辑：
+
+```typescript
+// 在 sendPayload.ts 中添加自定义格式
+if (appId === "your-tool-name") {
+  body = getYourToolPayload({ ...data, createdAt });
+}
+```
+
+### 11.2 添加新的触发事件类型
+
+#### 步骤 1: 添加枚举值
+
+在 `packages/prisma/schema.prisma` 中：
+
+```prisma
+enum WebhookTriggerEvents {
+  // 现有事件...
+  NEW_EVENT_TYPE
+}
+```
+
+#### 步骤 2: 创建 DataFetcher
+
+在 `packages/features/webhooks/lib/service/data-fetchers/` 中：
+
+```typescript
+export class NewEventWebhookDataFetcher implements IWebhookDataFetcher {
+  canHandle(triggerEvent: WebhookTriggerEvents): boolean {
+    return triggerEvent === WebhookTriggerEvents.NEW_EVENT_TYPE;
+  }
+
+  getSubscriberContext(payload: WebhookTaskPayload): SubscriberContext {
+    // 返回订阅者查询上下文
+  }
+
+  async fetchEventData(payload: WebhookTaskPayload): Promise<WebhookEventData | null> {
+    // 从数据库获取完整数据
+  }
+}
+```
+
+#### 步骤 3: 注册到 Consumer
+
+在 `WebhookTaskConsumer` 中：
+
+```typescript
+constructor(/* ... */) {
+  this.dataFetchers = [
+    // 现有 fetchers...
+    new NewEventWebhookDataFetcher(),
+  ];
+}
+```
+
+#### 步骤 4: 添加生产者方法
+
+在 `WebhookTaskerProducerService` 中：
+
+```typescript
+async queueNewEventWebhook(params: NewEventParams): Promise<void> {
+  const operationId = v4();
+  
+  this.log.debug("Queueing new event webhook task", {
+    operationId,
+    triggerEvent: WebhookTriggerEvents.NEW_EVENT_TYPE,
+    // ... 其他参数
+  });
+
+  await this.queueTask(operationId, {
+    operationId,
+    triggerEvent: WebhookTriggerEvents.NEW_EVENT_TYPE,
+    timestamp: new Date().toISOString(),
+    // ... 其他 payload 字段
+  });
+}
+```
+
+---
+
+## 附录: 关键代码索引
+
+### Webhook 核心
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 创建订阅 | `trpc/server/routers/viewer/webhook/create.handler.ts` | - |
+| 更新订阅 | `trpc/server/routers/viewer/webhook/edit.handler.ts` | - |
+| 删除订阅 | `trpc/server/routers/viewer/webhook/delete.handler.ts` | - |
+| 生产者服务 | `features/webhooks/lib/service/WebhookTaskerProducerService.ts` | - |
+| 消费者服务 | `features/webhooks/lib/service/WebhookTaskConsumer.ts` | 33 |
+| 投递服务 | `features/webhooks/lib/service/WebhookService.ts` | 135 |
+| Payload 发送 | `features/webhooks/lib/sendPayload.ts` | 217, 312 |
+| Trigger 配置 | `features/webhooks/lib/tasker/trigger/config.ts` | - |
+| 定时触发处理 | `features/webhooks/lib/handleWebhookScheduledTriggers.ts` | - |
+| 订阅管理 | `features/webhooks/lib/scheduleTrigger.ts` | 30, 132 |
+
+### 自动化工具
+
+| 功能 | Zapier | Make |
+|------|--------|------|
+| 鉴权函数 | `app-store/zapier/lib/validateAccountOrApiKey.ts` | - |
+| 添加订阅 | `app-store/zapier/api/subscriptions/addSubscription.ts` | `app-store/make/api/subscriptions/addSubscription.ts` |
+| 删除订阅 | `app-store/zapier/api/subscriptions/deleteSubscription.ts` | `app-store/make/api/subscriptions/deleteSubscription.ts` |
+| API Key 验证 | `app-store/_utils/findValidApiKey.ts` | 相同 |
+
+---
+
+**文档版本**: 1.0  
+**最后更新**: 2024年  
+**分析范围**: Cal.diy Webhook 系统及 Zapier/Make 自动化工具集成
