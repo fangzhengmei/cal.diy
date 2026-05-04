@@ -1,119 +1,35 @@
-# 公开预约页表单渲染、SEO 元数据与缓存策略协作分析
+# 公开预约页缓存命中与失效分析
 
-本文档基于代码证据，梳理公开预约页（`/[user]/[type]`）的渲染流程、元数据生成和缓存策略的可对账链路。
-
----
-
-## 一、代码位置索引
-
-| 模块 | 文件路径 |
-|------|----------|
-| 页面入口 | `apps/web/app/(booking-page-wrapper)/[user]/[type]/page.tsx` |
-| SSR 数据获取 | `apps/web/server/lib/[user]/[type]/getServerSideProps.ts` |
-| 公开事件查询 | `packages/features/eventtypes/lib/getPublicEvent.ts` |
-| 元数据工具 | `apps/web/app/_utils.tsx` |
-| Booker 包装器 | `apps/web/modules/bookings/components/BookerWebWrapper.tsx` |
-| Booker 主组件 | `apps/web/modules/bookings/components/Booker.tsx` |
-| 预订表单 | `apps/web/modules/bookings/components/BookEventForm/BookEventForm.tsx` |
-| 表单字段 | `apps/web/modules/bookings/components/BookEventForm/BookingFields.tsx` |
-| tRPC 配置 | `packages/trpc/react/trpc.ts` |
-| Next.js 配置 | `apps/web/next.config.ts` |
+本文档基于代码证据，梳理公开预约页（`/[user]/[type]`）在三类时序下的缓存行为，明确输入输出、命中条件、失效条件和回退路径。
 
 ---
 
-## 二、渲染流程可对账链路
+## 一、代码位置速查
 
-### 2.1 整体流程图
+| 功能 | 文件路径 | 行号 |
+|------|----------|------|
+| tRPC 默认 staleTime | `packages/trpc/react/trpc.ts` | 107 |
+| useSchedule 配置 | `apps/web/modules/schedules/hooks/useSchedule.ts` | 116-136 |
+| 缓存常量定义 | `packages/lib/constants.ts` | 84-93, 243 |
+| 缓存失效触发 | `apps/web/modules/bookings/components/Booker.tsx` | 260-266 |
+| invalidate 实现 | `apps/web/modules/schedules/hooks/useSchedule.ts` | 191-193 |
+| EventRepository 直接调用 | `packages/features/eventtypes/repositories/EventRepository.ts` | 12-24 |
+| getPublicEvent 数据库查询 | `packages/features/eventtypes/lib/getPublicEvent.ts` | 430-436 |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           用户请求 /[user]/[type]                        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Next.js 服务端处理阶段                            │
-│                                                                          │
-│  1. 调用 generateMetadata() 生成 SEO 元数据                             │
-│     └── 调用 getData() → getServerSideProps() → 数据库查询             │
-│                                                                          │
-│  2. 调用 ServerPage() 渲染页面组件                                       │
-│     └── 调用 getData() → getServerSideProps() → 数据库查询             │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        客户端 Hydration 阶段                              │
-│                                                                          │
-│  1. users-type-public-view.tsx                                          │
-│     └── 接收服务端传递的 eventData props                                 │
-│         └── 渲染 BookerWebWrapper                                        │
-│                                                                          │
-│  2. BookerWebWrapper.tsx                                                 │
-│     ├── 若 props.eventData 存在，直接使用（跳过客户端获取）             │
-│     ├── 初始化 BookerStore                                               │
-│     ├── useBookingForm() - 初始化表单                                   │
-│     ├── useScheduleForEvent() - 获取可用时间段（tRPC）                 │
-│     └── 渲染 Booker 组件                                                 │
-│                                                                          │
-│  3. Booker.tsx                                                           │
-│     ├── 状态机管理: loading → selecting_date → selecting_time → booking│
-│     └── 条件渲染 BookEventForm                                           │
-│                                                                          │
-│  4. BookEventForm.tsx                                                    │
-│     └── 渲染 BookingFields + 提交按钮                                    │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-### 2.2 链路 1：服务端数据获取（getServerSideProps）
+## 二、缓存策略基础配置
 
-#### 输入
+### 2.1 服务端缓存配置
 
-| 输入项 | 来源 | 代码位置 |
-|--------|------|----------|
-| `context.params.user` | URL 路径参数 | `getServerSideProps.ts:314-316` |
-| `context.params.type` | URL 路径参数 | `getServerSideProps.ts:314-316` |
-| `context.query.rescheduleUid` | 查询参数 | `getServerSideProps.ts:117` |
-| `context.query.bookingUid` | 查询参数 | `getServerSideProps.ts:117` |
-| `context.query.orgRedirection` | 查询参数 | `getServerSideProps.ts:250` |
+#### 已验证：服务端无缓存
 
-#### 处理流程
-
-**Step 1：参数解析**
-```typescript
-// getServerSideProps.ts:307-310
-const paramsSchema = z.object({
-  type: z.string().transform((s) => slugify(s)),
-  user: z.string().transform((s) => getUsernameList(s)),
-});
-
-// getServerSideProps.ts:314-318
-export const getServerSideProps = async (context: GetServerSidePropsContext) => {
-  const { user } = paramsSchema.parse(context.params);
-  const isDynamicGroup = user.length > 1;
-  return isDynamicGroup ? await getDynamicGroupPageProps(context) : await getUserPageProps(context);
-};
-```
-
-**Step 2：事件查询（直接查数据库，无缓存）**
-```typescript
-// getServerSideProps.ts:245-253 (getUserPageProps)
-const eventData = await EventRepository.getPublicEvent(
-  {
-    username,
-    eventSlug: slug,
-    org,
-    fromRedirectOfNonOrgLink: context.query.orgRedirection === "true",
-  },
-  session?.user?.id
-);
-```
-
+**代码证据 1：EventRepository 直接调用**
 ```typescript
 // EventRepository.ts:12-24
 export class EventRepository {
   static async getPublicEvent(input: GetPublicEventInput, userId?: number) {
-    // 直接调用 getPublicEvent，无缓存包装
+    // 无 unstable_cache 包装，直接调用
     const event = await getPublicEvent(
       input.username,
       input.eventSlug,
@@ -128,372 +44,7 @@ export class EventRepository {
 }
 ```
 
-```typescript
-// getPublicEvent.ts:430-436
-let event = await prisma.eventType.findFirst({
-  where: {
-    slug: eventSlug,
-    ...usersOrTeamQuery,
-  },
-  select: getPublicEventSelect(fetchAllUsers),
-});
-```
-
-**Step 3：SEO 可索引性判断**
-```typescript
-// getServerSideProps.ts:261-265
-const allowSEOIndexing = org
-  ? user?.profile?.organization?.organizationSettings?.allowSEOIndexing
-    ? user?.allowSEOIndexing
-    : false
-  : user?.allowSEOIndexing;
-```
-
-**Step 4：改期/座位预订处理**
-```typescript
-// getServerSideProps.ts:281-300
-if (rescheduleUid) {
-  const processRescheduleResult = await processReschedule({
-    props,
-    rescheduleUid,
-    session,
-    allowRescheduleForCancelledBooking,
-  });
-  if (processRescheduleResult) {
-    return processRescheduleResult;  // 可能返回 redirect 或 notFound
-  }
-}
-```
-
-#### 输出
-
-| 输出项 | 类型 | 代码位置 |
-|--------|------|----------|
-| `eventData` | `PublicEventType` | `getServerSideProps.ts:268` |
-| `isSEOIndexable` | `boolean \| null` | `getServerSideProps.ts:275` |
-| `isBrandingHidden` | `boolean` | `getServerSideProps.ts:271-274` |
-| `rescheduleUid` | `string \| null` | `getServerSideProps.ts:277` |
-| `bookingUid` | `string \| null` | `getServerSideProps.ts:276` |
-| `redirect` | `{ destination: string, permanent: boolean }` | `getServerSideProps.ts:48-52` |
-| `notFound` | `true` | `getServerSideProps.ts:144-146` |
-
-#### 边界场景
-
-| 场景 | 触发条件 | 处理方式 | 代码位置 |
-|------|----------|----------|----------|
-| 事件不存在 | `!eventData` | 返回 `notFound: true` | `getServerSideProps.ts:255-259` |
-| 用户不存在 | `!user` | 返回 `notFound: true` | `getServerSideProps.ts:235-239` |
-| 事件禁止改期 | `booking.eventType.disableRescheduling` | 重定向到 `/booking/[uid]` | `getServerSideProps.ts:46-52` |
-| 已取消预订改期 | `booking.status === CANCELLED` | 需 `allowRescheduleForCancelledBooking=true` | `getServerSideProps.ts:59-63` |
-
----
-
-### 2.3 链路 2：元数据生成（generateMetadata）
-
-#### 输入
-
-| 输入项 | 来源 | 代码位置 |
-|--------|------|----------|
-| `params` | URL 路径参数 | `page.tsx:36` |
-| `searchParams` | URL 查询参数 | `page.tsx:36` |
-| `headers()` | 请求头 | `page.tsx:37` |
-| `cookies()` | Cookie | `page.tsx:37` |
-
-#### 处理流程
-
-**Step 1：构建 legacy 上下文**
-```typescript
-// page.tsx:37
-const legacyCtx = buildLegacyCtx(await headers(), await cookies(), await params, await searchParams);
-```
-
-**Step 2：获取数据（与页面渲染共享相同逻辑）**
-```typescript
-// page.tsx:38
-const props = await getData(legacyCtx);  // 调用 withAppDirSsr(getServerSideProps)
-```
-
-**Step 3：提取元数据相关字段**
-```typescript
-// page.tsx:40-52
-const { booking, isSEOIndexable = true, eventData, isBrandingHidden } = props;
-const rescheduleUid = booking?.uid;
-const profileName = eventData?.profile?.name ?? "";
-const title = eventData?.title ?? "";
-
-const meeting = {
-  title,
-  profile: { name: profileName, image: eventData?.profile.image },
-  users: eventData?.subsetOfUsers.map((user) => ({
-    name: `${user.name}`,
-    username: `${user.username}`,
-  })) || [],
-};
-```
-
-**Step 4：调用元数据生成工具**
-```typescript
-// page.tsx:54-61
-const metadata = await generateMeetingMetadata(
-  meeting,
-  (t) => `${rescheduleUid && !!booking ? t("reschedule") : ""} ${title} | ${profileName}`,
-  (t) => `${rescheduleUid ? t("reschedule") : ""} ${title}`,
-  isBrandingHidden,
-  WEBAPP_URL,
-  `/${decodedParams.user}/${decodedParams.type}`
-);
-```
-
-**Step 5：覆盖 robots 指令**
-```typescript
-// page.tsx:63-69
-return {
-  ...metadata,
-  robots: {
-    follow: !(eventData?.hidden || !isSEOIndexable),
-    index: !(eventData?.hidden || !isSEOIndexable),
-  },
-};
-```
-
-#### generateMeetingMetadata 内部流程
-
-```typescript
-// _utils.tsx:125-149
-export const generateMeetingMetadata = async (
-  meeting: MeetingImageProps,
-  getTitle, getDescription, hideBranding, origin, pathname
-) => {
-  // Step 1: 生成基础元数据（不含图片）
-  const metadata = await _generateMetadataWithoutImage(
-    getTitle, getDescription, hideBranding, origin, pathname
-  );
-  
-  // Step 2: 构建 OG 图片 URL
-  const image = SEO_IMG_OGIMG + (await constructMeetingImage(meeting));
-
-  return {
-    ...metadata,
-    openGraph: {
-      ...metadata.openGraph,
-      images: [image],
-    },
-  };
-};
-```
-
-```typescript
-// _utils.tsx:21-51
-const _generateMetadataWithoutImage = async (...) => {
-  const canonical = buildCanonical({ path: pathname, origin });
-  const t = await getTranslate();
-
-  const title = getTitle(t);
-  const description = getDescription(t);
-  const displayedTitle = hideBranding ? title : `${title} | ${APP_NAME}`;
-
-  return {
-    title: displayedTitle,
-    description,
-    alternates: { canonical },
-    openGraph: {
-      description: truncateOnWord(description, 158),
-      url: canonical,
-      type: "website",
-      siteName: APP_NAME,
-      title: displayedTitle,
-    },
-    metadataBase,
-  };
-};
-```
-
-#### 输出
-
-| 输出字段 | 数据源 | 代码位置 |
-|----------|--------|----------|
-| `title` | `eventData.title` + `eventData.profile.name` | `page.tsx:56` |
-| `description` | `eventData.title`（改期时加 "reschedule"） | `page.tsx:57` |
-| `alternates.canonical` | `WEBAPP_URL` + 路径 | `_utils.tsx:29` |
-| `openGraph.title` | 同 `title` | `_utils.tsx:47` |
-| `openGraph.description` | 截断为 158 字符 | `_utils.tsx:43` |
-| `openGraph.url` | canonical URL | `_utils.tsx:44` |
-| `openGraph.images` | `constructMeetingImage(meeting)` | `_utils.tsx:140` |
-| `robots.index` | `!(eventData.hidden \|\| !isSEOIndexable)` | `page.tsx:67` |
-| `robots.follow` | 同 `index` | `page.tsx:66` |
-
-#### 边界场景
-
-| 场景 | 触发条件 | 输出结果 | 代码位置 |
-|------|----------|----------|----------|
-| 隐藏事件 | `eventData.hidden === true` | `robots: { index: false, follow: false }` | `page.tsx:65-68` |
-| SEO 禁用 | `isSEOIndexable === false` | `robots: { index: false, follow: false }` | `page.tsx:65-68` |
-| 改期场景 | `rescheduleUid` 存在 | 标题前缀加 "Reschedule" | `page.tsx:56-57` |
-| 品牌隐藏 | `isBrandingHidden === true` | 标题不加 `\| ${APP_NAME}` | `_utils.tsx:35` |
-
----
-
-### 2.4 链路 3：客户端数据获取与表单渲染
-
-#### 输入（服务端传递的 props）
-
-| 输入项 | 类型 | 代码位置 |
-|--------|------|----------|
-| `eventData` | `PublicEventType` | `users-type-public-view.tsx:27` |
-| `user` | `string` | `users-type-public-view.tsx:27` |
-| `slug` | `string` | `users-type-public-view.tsx:27` |
-| `booking` | `GetBookingType \| undefined` | `users-type-public-view.tsx:27` |
-| `isBrandingHidden` | `boolean` | `users-type-public-view.tsx:27` |
-| `orgBannerUrl` | `string \| null` | `users-type-public-view.tsx:27` |
-
-#### 处理流程
-
-**Step 1：服务端数据直接使用（跳过客户端获取）**
-```typescript
-// BookerWebWrapper.tsx:39-50
-const clientFetchedEvent = useEvent({
-  disabled: !!props.eventData,  // 有服务端数据时禁用
-  fromRedirectOfNonOrgLink: props.entity.fromRedirectOfNonOrgLink,
-});
-
-const event = props.eventData
-  ? {
-      data: props.eventData,
-      isSuccess: true,
-      isError: false,
-      isPending: false,
-    }
-  : clientFetchedEvent;  // fallback 到客户端获取
-```
-
-**Step 2：useEvent Hook（备用路径，当无服务端数据时使用）**
-```typescript
-// useEvent.ts:21-46
-export const useEvent = (props?: { fromRedirectOfNonOrgLink?: boolean; disabled?: boolean }) => {
-  const [username, eventSlug, isTeamEvent, org] = useBookerStoreContext(...);
-
-  const event = trpc.viewer.public.event.useQuery(
-    {
-      username: username ?? "",
-      eventSlug: eventSlug ?? "",
-      isTeamEvent,
-      org: org ?? null,
-      fromRedirectOfNonOrgLink: props?.fromRedirectOfNonOrgLink,
-    },
-    {
-      refetchOnWindowFocus: false,
-      enabled: !props?.disabled && Boolean(username) && Boolean(eventSlug),
-    }
-  );
-  // ...
-};
-```
-
-**Step 3：表单初始化**
-```typescript
-// BookerWebWrapper.tsx:114-122
-const bookerForm = useBookingForm({
-  event: event.data,
-  sessionEmail: session?.user.email,
-  sessionUsername: session?.user.username,
-  sessionName: session?.user.name,
-  hasSession,
-  extraOptions: routerQuery,
-  prefillFormParams,
-});
-```
-
-**Step 4：可用时间段获取（客户端 tRPC）**
-```typescript
-// BookerWebWrapper.tsx:139-153
-const schedule = useScheduleForEvent({
-  eventId: props.entity.eventTypeId ?? event.data?.id,
-  username: props.username,
-  // ...
-});
-```
-
-**Step 5：Booker 状态机**
-```typescript
-// Booker.tsx:221-229
-useEffect(() => {
-  if (event.isPending) return setBookerState("loading");
-  if (!selectedDate) return setBookerState("selecting_date");
-  if (!selectedTimeslot) return setBookerState("selecting_time");
-  const isSkipConfirmStepSupported = layout !== BookerLayouts.WEEK_VIEW;
-  if (selectedTimeslot && skipConfirmStep && isSkipConfirmStepSupported)
-    return setBookerState("selecting_time");
-  return setBookerState("booking");
-}, [...]);
-```
-
-**Step 6：表单渲染（仅当 bookerState === "booking"）**
-```typescript
-// Booker.tsx:250-293
-const EventBooker = useMemo(() => {
-  if (bookerState !== "booking") {
-    return null;
-  }
-
-  return (
-    <BookEventForm
-      key={key}
-      timeslot={selectedTimeslot}
-      bookingForm={bookingForm}
-      eventQuery={event}
-      // ...
-    />
-  );
-}, [...]);
-```
-
-#### 输出
-
-| 输出项 | 类型 | 说明 |
-|--------|------|------|
-| `bookerState` | `'loading' \| 'selecting_date' \| 'selecting_time' \| 'booking'` | 当前状态 |
-| `bookingForm` | `UseFormReturn` | react-hook-form 实例 |
-| `formEmail` | `string` | 表单中的邮箱值 |
-| `formName` | `string` | 表单中的姓名值 |
-| `schedule` | `{ data, isPending, invalidate, ... }` | 可用时间表数据 |
-
-#### 边界场景
-
-| 场景 | 触发条件 | 处理方式 | 代码位置 |
-|------|----------|----------|----------|
-| 服务端无数据 | `!props.eventData` | 使用 `useEvent` 客户端获取 | `BookerWebWrapper.tsx:39-50` |
-| 无选中日期 | `!selectedDate` | 状态设为 `selecting_date` | `Booker.tsx:223` |
-| 无选中时间段 | `!selectedTimeslot` | 状态设为 `selecting_time` | `Booker.tsx:224` |
-| 时间段不可用 | `unavailableTimeSlots.includes(timeslot)` | 显示警告，禁用提交 | `BookEventForm.tsx:153-174` |
-
----
-
-## 三、缓存策略可对账链路
-
-### 3.1 缓存使用情况总览
-
-| 缓存类型 | 适用范围 | 是否使用 | 代码位置 |
-|----------|----------|----------|----------|
-| **服务端 Data Cache** (`unstable_cache`) | `getPublicEvent` | ❌ 未使用 | 见下方验证 |
-| **客户端 React Query 缓存** | tRPC queries | ✅ 使用 | `trpc.ts:107` |
-| **HTTP 响应头缓存** | 静态资源 | ✅ 使用 | `next.config.ts:448-456` |
-| **HTTP 响应头缓存** | API/页面 | ❌ 未配置 | 无相关配置 |
-
-### 3.2 验证：getPublicEvent 未使用缓存
-
-**证据 1：EventRepository 直接调用**
-```typescript
-// EventRepository.ts:12-24
-export class EventRepository {
-  static async getPublicEvent(input: GetPublicEventInput, userId?: number) {
-    // 无 unstable_cache 包装，直接调用
-    const event = await getPublicEvent(...);
-    return event;
-  }
-}
-```
-
-**证据 2：getPublicEvent 直接查库**
+**代码证据 2：getPublicEvent 直接查库**
 ```typescript
 // getPublicEvent.ts:430-436
 let event = await prisma.eventType.findFirst({
@@ -506,22 +57,15 @@ let event = await prisma.eventType.findFirst({
 // 无缓存逻辑
 ```
 
-**证据 3：getServerSideProps 无缓存配置**
+**代码证据 3：无 Next.js 缓存配置**
 ```typescript
-// getServerSideProps.ts:245-253
-const eventData = await EventRepository.getPublicEvent(...);
-// 每次请求都执行，无缓存包装
+// [user]/[type]/page.tsx 中无以下配置：
+// - 无 export const revalidate
+// - 无 export const dynamic
+// - 无 export const fetchCache
 ```
 
-**证据 4：page.tsx 无缓存配置**
-```typescript
-// 检查 [user]/[type]/page.tsx
-// 无 export const revalidate
-// 无 export const dynamic
-// 无 export const fetchCache
-```
-
-**对比：其他模块使用了 unstable_cache**
+**反例：其他模块使用了缓存**
 ```typescript
 // travelSchedule.ts:9-22（作为对比，这个模块使用了缓存）
 export const getTravelSchedule = unstable_cache(
@@ -530,16 +74,23 @@ export const getTravelSchedule = unstable_cache(
   },
   ["getTravelSchedule"],
   {
-    revalidate: NEXTJS_CACHE_TTL,  // 3600 秒
+    revalidate: NEXTJS_CACHE_TTL,  // 3600 秒 = 1 小时
     tags: [CACHE_TAGS.TRAVEL_SCHEDULES],
   }
 );
 ```
 
-### 3.3 客户端 React Query 缓存
+**结论**：
+- ✅ 服务端 `getPublicEvent` 无缓存
+- ✅ 每次请求都直接查询数据库
+- ❌ 无 `unstable_cache` 包装
+- ❌ 无 `revalidate` / `dynamic` / `fetchCache` 配置
 
-#### 配置
+### 2.2 客户端缓存配置
 
+#### tRPC 默认配置
+
+**代码证据**：
 ```typescript
 // trpc.ts:100-122
 queryClientConfig: {
@@ -554,12 +105,81 @@ queryClientConfig: {
 }
 ```
 
-#### useEvent 覆盖配置
+**说明**：
+- `staleTime: 1000`：查询结果在 1 秒内视为新鲜
+- 超过 1 秒后，数据变旧，但仍可使用（stale-while-revalidate）
 
+#### useSchedule（时间段查询）配置
+
+**代码证据**：
+```typescript
+// useSchedule.ts:116-136
+const options = {
+  trpc: {
+    context: {
+      skipBatch: true,
+    },
+  },
+  // 窗口聚焦时重新获取
+  refetchOnWindowFocus: true,
+  // 5 分钟轮询一次
+  refetchInterval: PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS * 1000,
+  enabled:
+    !skipGetSchedule &&
+    Boolean(username) &&
+    Boolean(month) &&
+    Boolean(timezone) &&
+    (Boolean(eventSlug) || Boolean(eventId) || eventId === 0) &&
+    enabledProp,
+};
+```
+
+#### 缓存常量定义
+
+**代码证据**：
+```typescript
+// constants.ts:84-93
+// 预留相关（时间段锁定）
+export const PUBLIC_QUERY_RESERVATION_INTERVAL_SECONDS =
+  parseInt(process.env.NEXT_PUBLIC_QUERY_RESERVATION_INTERVAL_SECONDS ?? "", 10) || 30;
+
+export const PUBLIC_QUERY_RESERVATION_STALE_TIME_SECONDS =
+  parseInt(process.env.NEXT_PUBLIC_QUERY_RESERVATION_STALE_TIME_SECONDS ?? "", 10) || 20;
+
+// 可用时间段轮询间隔
+export const PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS =
+  parseInt(process.env.NEXT_PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS ?? "", 10) || 5 * 60;
+
+// 缓存失效开关
+export const PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM =
+  process.env.NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM === "1";
+
+// constants.ts:243
+export const NEXTJS_CACHE_TTL = 3600; // 1 hour（用于其他模块，非公开预约页）
+```
+
+**常量说明**：
+| 常量 | 默认值 | 说明 |
+|------|--------|------|
+| `PUBLIC_QUERY_RESERVATION_INTERVAL_SECONDS` | 30 秒 | 时间段预留有效时长 |
+| `PUBLIC_QUERY_RESERVATION_STALE_TIME_SECONDS` | 20 秒 | 预留查询缓存时间 |
+| `PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS` | 5 分钟 | 可用时间段轮询间隔 |
+| `PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM` | `false` | 预订表单取消时是否失效缓存 |
+| `NEXTJS_CACHE_TTL` | 3600 秒 | 服务端 Data Cache TTL（用于其他模块） |
+
+#### useEvent 配置
+
+**代码证据**：
 ```typescript
 // useEvent.ts:27-38
 const event = trpc.viewer.public.event.useQuery(
-  { ... },
+  {
+    username: username ?? "",
+    eventSlug: eventSlug ?? "",
+    isTeamEvent,
+    org: org ?? null,
+    fromRedirectOfNonOrgLink: props?.fromRedirectOfNonOrgLink,
+  },
   {
     refetchOnWindowFocus: false,  // 窗口聚焦时不重新获取
     enabled: !props?.disabled && Boolean(username) && Boolean(eventSlug),
@@ -567,136 +187,64 @@ const event = trpc.viewer.public.event.useQuery(
 );
 ```
 
-#### 缓存行为
-
-| 配置项 | 值 | 行为 |
-|--------|-----|------|
-| `staleTime` | `1000` ms | 查询结果在 1 秒内视为新鲜 |
-| `refetchOnWindowFocus` | `false` | 窗口切换回来不自动刷新 |
-| `enabled` | 条件 | 有 `username` 和 `eventSlug` 时才执行 |
-
-### 3.4 HTTP 静态资源缓存
-
-```typescript
-// next.config.ts:448-456
-{
-  source: "/icons/sprite.svg(\\?v=[0-9a-zA-Z\\-\\.]+)?",
-  headers: [
-    {
-      key: "Cache-Control",
-      value: "public, max-age=31536000, immutable",  // 1 年，不可变
-    },
-  ],
-}
-```
-
-**注意**：此配置仅适用于 `/icons/sprite.svg`，不适用于页面或 API 路由。
+**关键点**：
+- `refetchOnWindowFocus: false`：窗口切换回来不自动刷新
+- 当 `props.eventData` 存在时，`disabled: true`，`useEvent` 不会执行
 
 ---
 
-## 四、三者协作关系（基于代码证据）
+## 三、三类时序分析
 
-### 4.1 数据流图
+### 3.1 时序 1：首次请求
+
+#### 输入
+
+| 输入项 | 来源 | 说明 |
+|--------|------|------|
+| `params.user` | URL 路径 | 用户名（如 `alice`） |
+| `params.type` | URL 路径 | 事件类型 slug（如 `30min`） |
+| `searchParams.rescheduleUid` | 查询参数 | 改期预订 UID（可选） |
+| `searchParams.bookingUid` | 查询参数 | 座位预订 UID（可选） |
+| `searchParams.duration` | 查询参数 | 时长（可选，如 `60`） |
+
+#### 服务端处理流程
+
+**Step 1：generateMetadata 执行**
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           首次请求                                        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-┌───────────────┐         ┌───────────────┐         ┌───────────────┐
-│ generateMeta- │         │  ServerPage   │         │               │
-│    data()     │         │   (页面渲染)   │         │               │
-└───────┬───────┘         └───────┬───────┘         │               │
-        │                         │                   │               │
-        ▼                         ▼                   │               │
-┌─────────────────────────────────────────────┐       │               │
-│         getData(legacyCtx)                   │       │               │
-│  └── withAppDirSsr(getServerSideProps)      │       │               │
-│      └── EventRepository.getPublicEvent()    │       │               │
-│          └── getPublicEvent()                │       │               │
-│              └── prisma.eventType.findFirst()│      │               │
-│                  (每次都查数据库，无缓存)     │       │               │
-└─────────────────────────────────────────────┘       │               │
-        │                         │                   │               │
-        ▼                         ▼                   │               │
-┌───────────────┐         ┌───────────────┐         │               │
-│ 返回 Metadata │         │ 返回 Page     │         │               │
-│ (含 robots)   │         │ (含 eventData)│         │               │
-└───────────────┘         └───────┬───────┘         │               │
-                                    │                   │               │
-                                    ▼                   │               │
-                            ┌───────────────┐         │               │
-                            │  客户端 HTML  │         │               │
-                            │  (含 eventData│         │               │
-                            │   序列化数据)  │         │               │
-                            └───────┬───────┘         │               │
-                                    │                   │               │
-                                    ▼                   ▼               │
-                            ┌─────────────────────────────────────┐    │
-                            │         客户端 Hydration             │    │
-                            │                                     │    │
-                            │  BookerWebWrapper:                  │    │
-                            │  ├── 使用 props.eventData           │    │
-                            │  │   (跳过 useEvent 客户端获取)     │    │
-                            │  ├── useBookingForm() 初始化表单   │    │
-                            │  └── useScheduleForEvent()         │    │
-                            │      └── tRPC query (staleTime:   │    │
-                            │          1000ms 客户端缓存)        │    │
-                            └─────────────────────────────────────┘    │
-                                                                         │
-┌─────────────────────────────────────────────────────────────────────────┤
-│                           后续请求（1 秒内）                              │
-└─────────────────────────────────────────────────────────────────────────┤
-                                    │
-                                    ▼
-                            ┌───────────────┐
-                            │  服务端处理    │
-                            │  (每次都查库)  │
-                            │  (无服务端缓存)│
-                            └───────┬───────┘
-                                    │
-                                    ▼
-                            ┌───────────────┐
-                            │  客户端 Hydra- │
-                            │    tion       │
-                            │               │
-                            │ useSchedule-  │
-                            │ ForEvent():   │
-                            │ 若 1 秒内    │
-                            │ 使用 React   │
-                            │ Query 缓存    │
-                            └───────────────┘
+输入: params, searchParams, headers(), cookies()
+     ↓
+调用 getData(legacyCtx)
+     ↓
+withAppDirSsr(getServerSideProps)
+     ↓
+getUserPageProps / getDynamicGroupPageProps
+     ↓
+EventRepository.getPublicEvent(input, session?.user?.id)
+     ↓
+getPublicEvent(username, eventSlug, ...)
+     ↓
+prisma.eventType.findFirst(...)  ← 直接查询数据库
+     ↓
+返回 eventData
 ```
 
-### 4.2 关键协作点
+**Step 2：ServerPage 执行**
 
-#### 协作点 1：服务端数据共享
-
-**代码证据**：
-```typescript
-// page.tsx:15-16
-const getData: (ctx: ReturnType<typeof buildLegacyCtx>) => Promise<LegacyPageProps> =
-  withAppDirSsr<LegacyPageProps>(getServerSideProps);
-
-// page.tsx:18-20 (ServerPage)
-const legacyCtx = buildLegacyCtx(await headers(), await cookies(), await params, await searchParams);
-const props = await getData(legacyCtx);
-
-// page.tsx:37-38 (generateMetadata)
-const legacyCtx = buildLegacyCtx(await headers(), await cookies(), await params, await searchParams);
-const props = await getData(legacyCtx);
+```
+输入: params, searchParams, headers(), cookies()
+     ↓
+调用 getData(legacyCtx)  ← 同样的调用链
+     ↓
+prisma.eventType.findFirst(...)  ← 再次查询数据库
+     ↓
+返回 eventData
 ```
 
-**事实**：
-- `generateMetadata` 和 `ServerPage` 都调用 `getData(legacyCtx)`
-- 两者都执行相同的 `getServerSideProps` → `getPublicEvent` → 数据库查询
-- **无显式缓存或数据共享代码**，依赖 Next.js 内部行为
+#### 客户端处理流程
 
-#### 协作点 2：服务端 → 客户端数据传递
+**Step 1：接收服务端 props**
 
-**代码证据**：
 ```typescript
 // users-type-public-view.tsx:27-33
 function Type({ slug, user, isEmbed, booking, isBrandingHidden, eventData, orgBannerUrl }: PageProps) {
@@ -713,165 +261,407 @@ function Type({ slug, user, isEmbed, booking, isBrandingHidden, eventData, orgBa
 }
 ```
 
+**Step 2：useEvent 跳过执行**
+
 ```typescript
 // BookerWebWrapper.tsx:39-50
 const clientFetchedEvent = useEvent({
-  disabled: !!props.eventData,  // 有服务端数据时禁用
-  // ...
+  disabled: !!props.eventData,  // 有服务端数据时，disabled = true
+  fromRedirectOfNonOrgLink: props.entity.fromRedirectOfNonOrgLink,
 });
 
 const event = props.eventData
-  ? { data: props.eventData, isSuccess: true, isError: false, isPending: false }
-  : clientFetchedEvent;
+  ? {
+      data: props.eventData,
+      isSuccess: true,
+      isError: false,
+      isPending: false,
+    }
+  : clientFetchedEvent;  // fallback 到客户端获取
 ```
 
-**事实**：
-- 服务端获取的 `eventData` 通过 props 传递到客户端
-- 客户端 `useEvent` hook 检测到 `props.eventData` 存在时，`disabled: true`，跳过客户端获取
-- 这确保了**服务端和客户端使用相同的 eventData**，避免 hydration mismatch
+**Step 3：useSchedule 首次执行**
 
-#### 协作点 3：SEO 元数据与表单数据的关联
-
-**代码证据**：
 ```typescript
-// page.tsx:40-52 (generateMetadata)
-const { booking, isSEOIndexable = true, eventData, isBrandingHidden } = props;
-
-const meeting = {
-  title: eventData?.title ?? "",
-  profile: { 
-    name: eventData?.profile?.name ?? "", 
-    image: eventData?.profile.image 
-  },
-  users: eventData?.subsetOfUsers.map(...) || [],
-};
-
-// robots 控制
-return {
-  ...metadata,
-  robots: {
-    follow: !(eventData?.hidden || !isSEOIndexable),
-    index: !(eventData?.hidden || !isSEOIndexable),
-  },
-};
+// useSchedule.ts:150-154
+const schedule = trpc.viewer.slots.getSchedule.useQuery(input, {
+  ...options,
+  enabled: options.enabled && !isCallingApiV2Slots,
+});
 ```
 
-**关联字段**：
+#### 输出
 
-| 元数据字段 | 表单相关数据 | 说明 |
-|------------|--------------|------|
-| `title` | `eventData.title` | 表单页面标题 |
-| `openGraph.images` | `eventData.profile.image`, `eventData.title` | 社交分享图片 |
-| `robots.index` | `eventData.hidden`, `isSEOIndexable` | 控制搜索引擎索引 |
-| `canonical` | URL 路径 | 规范链接 |
+| 输出项 | 数据来源 | 缓存状态 |
+|--------|----------|----------|
+| `eventData` | 服务端数据库查询 | 无缓存，每次都查 |
+| `schedule` | 客户端 tRPC 查询 | 首次请求，无缓存 |
+| `bookerState` | 客户端状态机 | `loading` → `selecting_date` |
 
----
-
-## 五、边界场景汇总
-
-### 5.1 服务端边界场景
-
-| 场景 | 触发条件 | 行为 | 代码位置 |
-|------|----------|------|----------|
-| 用户不存在 | `getUsersInOrgContext()` 返回空 | `notFound: true` | `getServerSideProps.ts:235-239` |
-| 事件不存在 | `EventRepository.getPublicEvent()` 返回 null | `notFound: true` | `getServerSideProps.ts:255-259` |
-| 事件禁止改期 | `booking.eventType.disableRescheduling === true` | 重定向到 `/booking/[uid]` | `getServerSideProps.ts:46-52` |
-| 已取消预订改期 | `booking.status === CANCELLED` | 需 `allowRescheduleForCancelledBooking=true` | `getServerSideProps.ts:59-63` |
-
-### 5.2 SEO 边界场景
-
-| 场景 | 触发条件 | `robots.index` | `robots.follow` |
-|------|----------|-----------------|-----------------|
-| 正常事件 | `eventData.hidden = false`, `isSEOIndexable = true` | `true` | `true` |
-| 隐藏事件 | `eventData.hidden = true` | `false` | `false` |
-| SEO 禁用 | `isSEOIndexable = false` | `false` | `false` |
-
-### 5.3 客户端边界场景
+#### 边界场景
 
 | 场景 | 触发条件 | 行为 |
 |------|----------|------|
-| 无服务端数据 | `!props.eventData` | 使用 `useEvent` 客户端获取 |
-| 无选中日期 | `!selectedDate` | `bookerState = 'selecting_date'` |
-| 无选中时间段 | `!selectedTimeslot` | `bookerState = 'selecting_time'` |
-| 时间段不可用 | `unavailableTimeSlots.includes(timeslot)` | 显示警告，禁用提交按钮 |
+| 用户不存在 | `getUsersInOrgContext()` 返回空 | 服务端返回 `notFound: true` |
+| 事件不存在 | `EventRepository.getPublicEvent()` 返回 null | 服务端返回 `notFound: true` |
+| 事件禁止改期 | `booking.eventType.disableRescheduling === true` | 服务端重定向到 `/booking/[uid]` |
+
+#### 代码证据链
+
+| 环节 | 代码位置 | 证据 |
+|------|----------|------|
+| 服务端查库 | `getPublicEvent.ts:430-436` | `prisma.eventType.findFirst(...)` |
+| 无缓存包装 | `EventRepository.ts:12-24` | 无 `unstable_cache` |
+| useEvent 跳过 | `BookerWebWrapper.tsx:39-50` | `disabled: !!props.eventData` |
+| useSchedule 执行 | `useSchedule.ts:150-154` | `trpc.viewer.slots.getSchedule.useQuery` |
 
 ---
 
-## 六、关键结论（基于代码证据）
+### 3.2 时序 2：短时间重复访问
 
-### 6.1 已证实的结论
+#### 场景定义
 
-1. **服务端数据获取无缓存**
-   - `getPublicEvent` 每次都直接查询数据库
-   - 无 `unstable_cache` 包装
-   - 无 `revalidate` 或 `dynamic` 配置
+本时序包含两种情况：
+1. **场景 A**：页面内操作（不刷新页面，如切换月份、选择不同日期）
+2. **场景 B**：刷新页面（新的 HTTP 请求）
 
-2. **客户端 tRPC 有短缓存**
-   - `staleTime: 1000` ms（1 秒）
-   - `refetchOnWindowFocus: false`
+#### 场景 A：页面内操作（1 秒内）
 
-3. **服务端与客户端数据一致**
-   - 服务端 `eventData` 通过 props 传递
-   - 客户端 `useEvent` 检测到 `props.eventData` 时禁用自身
-   - 避免 hydration mismatch
+**输入**：
+- 同一个浏览器 tab
+- 用户操作：切换月份、选择日期等
+- 时间距离上次请求 < 1 秒
 
-4. **元数据生成与页面渲染共享数据源**
-   - 两者都调用 `getData(legacyCtx)`
-   - 但无显式缓存代码，依赖 Next.js 内部行为
+**缓存命中条件**：
+```
+条件 1: 距离上次 useSchedule 查询 < 1 秒 (staleTime: 1000)
+     AND
+条件 2: 查询参数相同 (username, eventSlug, month, startTime, endTime, timezone, etc.)
+     AND
+条件 3: 未到 refetchInterval (5 分钟)
+     AND
+条件 4: 未触发 refetchOnWindowFocus (窗口未失焦)
+```
 
-### 6.2 已删除的推断（无代码证据）
+**处理流程**：
+
+```
+用户操作（切换月份）
+     ↓
+useSchedule 查询参数变化（month 变了）
+     ↓
+新的 query key，无缓存，重新查询
+     ↓
+或者：
+
+用户操作（选择同一天的不同时间段）
+     ↓
+useSchedule 查询参数相同（startTime/endTime 未变）
+     ↓
+距离上次查询 < 1 秒
+     ↓
+✅ 命中 React Query 缓存
+     ↓
+直接返回缓存数据
+```
+
+**代码证据**：
+```typescript
+// trpc.ts:107
+staleTime: 1000,  // 1 秒内视为新鲜
+
+// useSchedule.ts:127
+refetchInterval: PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS * 1000,  // 5 分钟
+```
+
+**输出**：
+- **命中时返回缓存数据，未命中时重新查询
+
+#### 场景 B：刷新页面（新的 HTTP 请求）
+
+**输入**：
+- 用户点击浏览器刷新按钮
+- 或在地址栏按 Enter
+- 新的 HTTP 请求
+
+**缓存命中条件**：
+```
+无服务端缓存命中条件：❌ 无条件命中（服务端无缓存）
+
+客户端缓存命中条件：❌ 无条件命中（页面刷新，React Query 缓存清空）
+```
+
+**处理流程**：
+
+```
+新的 HTTP 请求到达服务端
+     ↓
+Next.js 重新执行 generateMetadata
+     ↓
+getData(legacyCtx) → getServerSideProps → 数据库查询  ← 无缓存
+     ↓
+Next.js 重新执行 ServerPage
+     ↓
+getData(legacyCtx) → getServerSideProps → 数据库查询  ← 无缓存
+     ↓
+返回新的 HTML 到客户端
+     ↓
+客户端重新初始化
+     ↓
+React Query 缓存被清空  ← 页面刷新
+     ↓
+useSchedule 重新查询  ← 无缓存
+```
+
+**代码证据**：
+```typescript
+// 服务端无缓存配置的证据：
+// - 无 export const revalidate
+// - 无 export const dynamic
+// - 无 unstable_cache 包装
+
+// 客户端页面刷新后，React Query 缓存清空是浏览器默认行为
+```
+
+#### 两类场景对比
+
+| 维度 | 场景 A：页面内操作 | 场景 B：刷新页面 |
+|------|-------------------|------------------|
+| 服务端请求 | ❌ 无 | ❌ 无 |
+| 客户端缓存 | ✅ 1 秒内可能命中 | ❌ 缓存清空 |
+| 数据库查询 | 仅查询参数变化时 | 每次都查询 |
+| 代码证据 | `trpc.ts:107` | 页面刷新行为 |
+
+#### 边界场景
+
+| 场景 | 触发条件 | 行为 |
+|------|----------|------|
+| 超过 1 秒 | 距离上次查询 > 1 秒 | 数据变旧，可能触发重新验证 |
+| 超过 5 分钟 | 距离上次查询 > 5 分钟 | `refetchInterval` 触发重新查询 |
+| 窗口失焦后返回 | 用户切换 tab 后返回 | `refetchOnWindowFocus: true` 触发重新查询 |
+
+---
+
+### 3.3 时序 3：用户操作触发刷新
+
+#### 场景定义
+
+用户在预订表单中点击"取消"按钮，返回时间段选择页面。
+
+#### 输入
+
+| 输入项 | 来源 | 说明 |
+|--------|------|------|
+| `selectedTimeslot` | 客户端状态 | 用户选中的时间段 |
+| `PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM` | 环境变量 | 缓存失效开关 |
+
+#### 处理流程
+
+**Step 1：用户点击"取消"按钮"
+
+**代码证据**：
+```typescript
+// Booker.tsx:260-274
+onCancel={() => {
+  setSelectedTimeslot(null);
+  // Temporarily allow disabling it, till we are sure that it doesn't cause any significant load on the system
+  if (PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM) {
+    // Ensures that user has latest available slots when they want to re-choose from the slots
+    schedule?.invalidate();
+  }
+  if (seatedEventData.bookingUid) {
+    setSeatedEventData({
+      ...seatedEventData,
+      bookingUid: undefined,
+      attendees: undefined,
+    });
+  }
+}}
+```
+
+**Step 2：invalidate 实现
+
+**代码证据**：
+```typescript
+// useSchedule.ts:186-194
+return {
+  ...schedule,
+  /**
+   * Invalidates the request and resends it regardless of any other configuration including staleTime
+   */
+  invalidate: () => {
+    return utils.viewer.slots.getSchedule.invalidate(input);
+  },
+};
+```
+
+#### 失效条件
+
+```
+条件 1: PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM === "1"
+     AND
+条件 2: schedule 存在 (schedule?.invalidate())
+```
+
+#### 回退路径
+
+```
+如果条件 1 不满足（环境变量未设置）：
+     ↓
+schedule?.invalidate() 不会被调用
+     ↓
+继续使用缓存数据（staleTime 内）
+     ↓
+或等待 5 分钟轮询更新
+```
+
+#### 输出
+
+| 环境变量状态 | 行为 | 数据新鲜度 |
+|-------------|------|-----------|
+| `NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM === "1" | 强制重新查询 | ✅ 新鲜 |
+| 环境变量未设置 | 使用缓存 | ⚠️ 可能过时 |
+
+#### 边界场景
+
+| 场景 | 触发条件 | 行为 |
+|------|----------|------|
+| 环境变量开启 | `NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM === "1" | `schedule.invalidate()` 被调用 |
+| 环境变量关闭 | 环境变量未设置或为其他值 | `schedule.invalidate()` 不被调用 |
+| 取消后立即选择 | 用户取消后立即选择新时间段 | 缓存数据可能已过时（如果环境变量关闭） |
+
+#### 代码证据链
+
+| 环节 | 代码位置 | 证据 |
+|------|----------|------|
+| 失效触发 | `Booker.tsx:260-266` | `if (PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM) { schedule?.invalidate(); }` |
+| 环境变量定义 | `constants.ts:92-93` | `process.env.NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM === "1"` |
+| invalidate 实现 | `useSchedule.ts:191-193` | `utils.viewer.slots.getSchedule.invalidate(input)` |
+
+---
+
+## 四、缓存行为汇总
+
+### 4.1 缓存命中/失效决策树
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+│                    公开预约页缓存决策树                          │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │  这是服务端请求吗？      │
+              │  (首次请求/刷新页面)     │
+              └───────────────────────────────┘
+                    │                 │
+                   是                 否
+                    │                 │
+                    ▼                 ▼
+         ┌────────────────┐    ┌──────────────────────┐
+         │ 服务端处理 │    │ 客户端页面内操作    │
+         │            │    │                    │
+         │ ❌ 无缓存  │    │ 检查 React Query  │
+         │ 每次查库  │    │ 缓存状态            │
+         └────────────────┘    └──────────────────────┘
+                                       │
+                                       ▼
+                        ┌───────────────────────────────┐
+                        │  距离上次查询 < 1 秒？     │
+                        │  (staleTime: 1000ms)    │
+                        └───────────────────────────────┘
+                              │                 │
+                             是                 否
+                              │                 │
+                              ▼                 ▼
+                     ┌────────────┐    ┌──────────────────┐
+                     │ ✅ 命中缓存 │    │ ⚠️ 数据变旧       │
+                     │ 直接返回   │    │ 可能重新验证      │
+                     └────────────┘    └──────────────────┘
+                                       │
+                                       ▼
+                            ┌──────────────────────────┐
+                            │ 用户点击"取消"按钮？      │
+                            └──────────────────────────┘
+                                  │           │
+                                 是           否
+                                  │           │
+                                  ▼           ▼
+                       ┌──────────────────┐    │
+                       │ 检查环境变量    │    │
+                       │ INVALIDATE_... │    │
+                       │ ON_BOOKING_FORM │    │
+                       └──────────────────┘    │
+                            │         │          │
+                           是         否         │
+                            │         │          │
+                            ▼         ▼          │
+                     ┌──────────┐  ┌──────────┐   │
+                     │ 强制   │  │ 使用   │   │
+                     │ 失效   │  │ 缓存   │   │
+                     └──────────┘  └──────────┘   │
+```
+
+### 4.2 三类时序对比表
+
+| 维度 | 时序 1：首次请求 | 时序 2A：页面内操作（<1秒） | 时序 2B：刷新页面 | 时序 3：用户取消操作 |
+|------|-----------------|------------------------------|------------------|---------------------|
+| **服务端缓存 | ❌ 无 | ❌ 无（服务端不参与） | ❌ 无，每次查库 | ❌ 无（服务端不参与） |
+| **客户端缓存** | ❌ 首次请求，无缓存 | ✅ 可能命中（<1秒） | ❌ 缓存清空 | ⚠️ 取决于环境变量 |
+| **数据库查询** | 服务端 + 客户端 | 仅查询参数变化时 | 服务端 + 客户端 | 环境变量开启时：客户端 |
+| **失效触发** | 无 | 无 | 页面刷新 | `schedule.invalidate()` |
+| **回退路径** | 无 | 无 | 无 | 使用缓存数据 |
+
+### 4.3 关键常量速查
+
+| 常量 | 默认值 | 影响 |
+|------|--------|------|
+| `staleTime` | 1000 ms | 1 秒内视为新鲜 |
+| `refetchInterval` | 5 分钟 | 定时轮询更新 |
+| `refetchOnWindowFocus` | `true` (useSchedule) / `false` (useEvent) | 窗口聚焦行为 |
+| `PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM` | `false` | 取消时是否失效缓存 |
+
+---
+
+## 五、已删除的推断
 
 以下结论**不在本文档中**，因为缺乏直接代码证据：
 
 1. ❌ "Next.js 会自动缓存相同参数的 `getData` 调用"
-   - 无显式缓存配置
+   - 代码中无显式缓存配置
    - `getServerSideProps` 每次都执行数据库查询
+   - 无 `revalidate` / `dynamic` / `fetchCache` 配置
 
 2. ❌ "公开预约页使用了 Next.js Data Cache"
    - 只有 `travelSchedule.ts` 和 `membership.ts` 使用了 `unstable_cache`
    - `getPublicEvent` 无缓存包装
 
-3. ❌ "表单值通过 BookerStore 持久化"
-   - 表单值同步到 store 的代码存在（`BookEventForm.tsx:116-122`）
-   - 但"持久化"暗示跨页面或刷新后保留，此行为需验证
-
-4. ❌ "多层次缓存策略"
+3. ❌ "多层次缓存策略"
    - 实际上只有：
      - 客户端 React Query 缓存（1 秒）
-     - 静态资源 HTTP 缓存（1 年）
+     - 静态资源 HTTP 缓存（1 年，非页面）
    - 服务端无缓存
+
+4. ❌ "表单值通过 BookerStore 持久化"
+   - 表单值同步到 store 的代码存在
+   - 但"持久化"暗示跨页面或刷新后保留，此行为未验证
 
 ---
 
-## 七、代码引用速查
+## 六、附录：环境变量配置参考
 
-### 7.1 渲染流程
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `NEXT_PUBLIC_QUERY_RESERVATION_INTERVAL_SECONDS` | number | 30 | 时间段预留有效时长（秒） |
+| `NEXT_PUBLIC_QUERY_RESERVATION_STALE_TIME_SECONDS` | number | 20 | 预留查询缓存时间（秒） |
+| `NEXT_PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS` | number | 300 | 可用时间段轮询间隔（秒） |
+| `NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM` | string | 未设置 | 预订表单取消时是否失效缓存（"1" 表示开启） |
 
-| 功能 | 文件 | 行号 |
-|------|------|------|
-| getServerSideProps 入口 | `getServerSideProps.ts` | 314-318 |
-| getUserPageProps 主逻辑 | `getServerSideProps.ts` | 212-305 |
-| EventRepository.getPublicEvent | `EventRepository.ts` | 12-24 |
-| getPublicEvent 数据库查询 | `getPublicEvent.ts` | 430-436 |
-| BookerWebWrapper 事件数据选择 | `BookerWebWrapper.tsx` | 39-50 |
-| useEvent hook | `useEvent.ts` | 21-46 |
-| Booker 状态机 | `Booker.tsx` | 221-229 |
+**配置示例**：
+```bash
+# 开启预订取消时缓存失效
+NEXT_PUBLIC_INVALIDATE_AVAILABLE_SLOTS_ON_BOOKING_FORM=1
 
-### 7.2 元数据生成
-
-| 功能 | 文件 | 行号 |
-|------|------|------|
-| generateMetadata 入口 | `page.tsx` | 36-70 |
-| generateMeetingMetadata | `_utils.tsx` | 125-149 |
-| _generateMetadataWithoutImage | `_utils.tsx` | 21-51 |
-| robots 指令覆盖 | `page.tsx` | 63-69 |
-| isSEOIndexable 判断 | `getServerSideProps.ts` | 261-265 |
-
-### 7.3 缓存策略
-
-| 功能 | 文件 | 行号 |
-|------|------|------|
-| tRPC 默认 staleTime | `trpc.ts` | 107 |
-| useEvent refetchOnWindowFocus | `useEvent.ts` | 36 |
-| 静态资源 Cache-Control | `next.config.ts` | 448-456 |
-| travelSchedule 缓存示例（对比） | `travelSchedule.ts` | 9-22 |
+# 缩短轮询间隔为 1 分钟
+NEXT_PUBLIC_QUERY_AVAILABLE_SLOTS_INTERVAL_SECONDS=60
+```
