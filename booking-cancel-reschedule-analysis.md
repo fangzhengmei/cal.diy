@@ -450,6 +450,19 @@ const lastAttendeeDeleteBooking = async (
 
 ---
 
+#### 重要概念澄清
+
+在深入分析前，需要明确区分两个关键概念：
+
+| 概念 | 数据库表 | 说明 |
+|-----|---------|------|
+| **Booking 记录** | `booking` | 预约的核心数据，包含 `startTime`, `endTime`, `status`, `userId` 等 |
+| **BookingReference 记录** | `bookingReference` | 外部日历/视频会议的引用，包含 `type`, `uid`, `externalCalendarId`, `credentialId` 等 |
+
+**这两个概念的复用策略完全不同，需要分别讨论。**
+
+---
+
 #### 路径1：组织者变更 (Changed Organizer)
 
 ##### 判断条件
@@ -495,15 +508,35 @@ if (changedOrganizer) {
 }
 ```
 
+**关键变量分析**（`EventManager.ts:771-774`）：
+
+```typescript
+const shouldUpdateBookingReferences =
+  !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+
+return {
+  results,
+  referencesToCreate: shouldUpdateBookingReferences ? updatedBookingReferences : [...booking.references],
+};
+```
+
+- `shouldUpdateBookingReferences = true`（因为 `changedOrganizer = true`）
+- `referencesToCreate = updatedBookingReferences`（新创建的 references）
+
 ##### 操作总结
 
-| 操作 | 说明 |
-|-----|------|
-| **删除旧事件** | 从原组织者的日历中删除事件和视频会议 |
-| **创建新事件** | 在新组织者的日历中创建新的事件和视频会议 |
-| **新建 BookingReferences** | 使用新创建的 references，不复用旧的 |
+| 操作对象 | 操作方式 | 说明 |
+|---------|---------|------|
+| **Booking 记录（普通预订）** | 新建 | 通过 `createBooking()` 创建新记录 |
+| **Booking 记录（座位预订-新时间段有预订）** | 复用新的 | 使用已存在的 `newTimeSlotBooking` |
+| **Booking 记录（座位预订-新时间段无预订）** | 复用旧的 | 更新现有记录的时间字段 |
+| **BookingReference 记录** | **新建** | 从 `createdEvent.referencesToCreate` 中获取 |
+| **旧 BookingReferences** | 废弃 | 从旧组织者日历中删除后，不再关联新 booking |
 
-**关键原因**：不同组织者有不同的日历凭证和目标日历，无法"更新"现有事件，只能删除旧的并创建新的。
+**关键原因**：
+- 不同组织者有不同的日历凭证和目标日历
+- 无法"更新"现有事件到另一个组织者的日历
+- 只能删除旧的并创建新的 references
 
 ---
 
@@ -583,6 +616,21 @@ if (isLocationChanged || isBookingRequestedReschedule || isDailyVideoRoomExpired
 }
 ```
 
+**关键变量分析**（`EventManager.ts:771-774`）：
+
+```typescript
+const shouldUpdateBookingReferences =
+  !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+
+return {
+  results,
+  referencesToCreate: shouldUpdateBookingReferences ? updatedBookingReferences : [...booking.references],
+};
+```
+
+- `shouldUpdateBookingReferences = true`（因为路径2条件为 true）
+- `referencesToCreate = updatedBookingReferences`（新创建的 references）
+
 ##### `updateLocation` 方法详解
 
 在 `EventManager.ts:418-493` 中：
@@ -609,13 +657,9 @@ public async updateLocation(event: CalendarEvent, booking: PartialBooking): Prom
   const calendarReference = booking.references.find((reference) => reference.type.includes("_calendar"));
   if (calendarReference) {
     results.push(...(await this.updateAllCalendarEvents(evt, booking)));
-    
-    if (evt.location === MSTeamsLocationType) {
-      this.updateMSTeamsVideoCallData(evt, results);
-    }
   }
 
-  // 3. 返回新的 references
+  // 3. 返回新的 references（从 results 中提取）
   const referencesToCreate = results.map((result) => {
     const updatedEvent = Array.isArray(result.updatedEvent) ? result.updatedEvent[0] : result.updatedEvent;
     const createdEvent = result.createdEvent;
@@ -642,11 +686,13 @@ public async updateLocation(event: CalendarEvent, booking: PartialBooking): Prom
 
 ##### 操作总结
 
-| 条件 | 视频会议操作 | 日历事件操作 | BookingReferences |
-|-----|------------|------------|------------------|
-| 地点变更 | 创建新的视频会议（如果是专用类型） | 更新日历事件 | **新建** |
-| 请求重排 | 创建新的视频会议（如果是专用类型） | 更新日历事件 | **新建** |
-| Daily房间过期 | 创建新的视频会议 | 更新日历事件 | **新建** |
+| 操作对象 | 操作方式 | 说明 |
+|---------|---------|------|
+| **Booking 记录（普通预订）** | 新建 | 通过 `createBooking()` 创建新记录 |
+| **Booking 记录（座位预订-新时间段有预订）** | 复用新的 | 使用已存在的 `newTimeSlotBooking` |
+| **Booking 记录（座位预订-新时间段无预订）** | 复用旧的 | 更新现有记录的时间字段 |
+| **BookingReference 记录** | **新建** | 从 `updatedLocation.referencesToCreate` 中获取 |
+| **旧 BookingReferences** | 废弃 | 不再关联新 booking |
 
 **关键原因**：
 - 地点变更可能意味着视频会议类型变化，需要创建新的会议链接
@@ -704,9 +750,7 @@ public async updateLocation(event: CalendarEvent, booking: PartialBooking): Prom
 }
 ```
 
-##### 关键差异：复用旧的 BookingReferences
-
-在 `EventManager.ts:771-774` 中：
+**关键变量分析**（`EventManager.ts:771-774`）：
 
 ```typescript
 const shouldUpdateBookingReferences =
@@ -719,14 +763,18 @@ return {
 };
 ```
 
+- `shouldUpdateBookingReferences = false`（所有条件都不满足）
+- `referencesToCreate = [...booking.references]`（**复用旧的 references**）
+
 ##### 操作总结
 
-| 操作 | 说明 |
-|-----|------|
-| **更新视频会议** | 专用会议类型时，更新现有会议（不是创建新的） |
-| **更新日历事件** | 修改现有事件的时间，保持 iCalUID 不变 |
-| **更新 CRM 事件** | 更新 CRM 系统中的事件 |
-| **复用 BookingReferences** | 使用旧的 `booking.references`，不创建新的 |
+| 操作对象 | 操作方式 | 说明 |
+|---------|---------|------|
+| **Booking 记录（普通预订）** | 新建 | 通过 `createBooking()` 创建新记录 |
+| **Booking 记录（座位预订-新时间段有预订）** | 复用新的 | 使用已存在的 `newTimeSlotBooking` |
+| **Booking 记录（座位预订-新时间段无预订）** | 复用旧的 | 更新现有记录的时间字段 |
+| **BookingReference 记录** | **复用旧的** | `referencesToCreate = [...booking.references]` |
+| **旧 BookingReferences** | 关联新 booking | 继续使用旧的 references |
 
 **关键原因**：
 - 只是时间变更，日历事件可以通过 PATCH 操作更新
@@ -770,7 +818,7 @@ return {
                     │                   │                    │
                     ▼                   ▼                    ▼
     ┌─────────────────────────────────────────────────────────────────┐
-    │                         操作对比                                  │
+    │                    BookingReference 行为对比                     │
     ├───────────────┬────────────────┬─────────────────────────────────┤
     │     路径1     │     路径2      │            路径3                │
     ├───────────────┼────────────────┼─────────────────────────────────┤
@@ -792,8 +840,51 @@ return {
 | **视频会议操作** | 删除旧的，创建新的 | 创建新的（专用类型时） | 更新现有会议 |
 | **日历事件操作** | 删除旧的，创建新的 | 更新现有事件 | 更新现有事件 |
 | **iCalUID** | 变化（新事件） | 保持不变 | 保持不变 |
-| **BookingReferences** | **新建** | **新建** | **复用旧的** |
+| **shouldUpdateBookingReferences** | **true** | **true** | **false** |
+| **BookingReference 行为** | **新建** | **新建** | **复用旧的** |
 | **适用场景** | 团队事件组织者变更 | 视频会议类型变化、二次重排、Daily房间过期 | 只是时间变更 |
+
+---
+
+#### Booking 记录复用策略对照表
+
+**注意**：Booking 记录的复用策略与三条路径**无关**，而是取决于：
+1. 是否为座位预订
+2. 新时间段是否已有预订
+
+| 场景 | Booking 记录行为 | 代码位置 |
+|-----|-----------------|---------|
+| **普通预订重排** | 总是新建 | `RegularBookingService.ts:1707` |
+| **座位预订-组织者重排-新时间段无预订** | 复用旧的（更新时间字段） | `moveSeatedBookingToNewTimeSlot.ts:63-68` |
+| **座位预订-组织者重排-新时间段有预订** | 复用新的（旧的标记为 CANCELLED） | `combineTwoSeatedBookings.ts:151-158` |
+| **座位预订-参会人重排-新时间段无预订** | 删除旧参会人，返回 null 触发新建 | `attendeeRescheduleSeatedBooking.ts:60-67` |
+| **座位预订-参会人重排-新时间段有预订** | 复用新的（更新 attendee.bookingId） | `attendeeRescheduleSeatedBooking.ts:70-85` |
+
+---
+
+#### 统一结论对照表
+
+这是**最终统一的结论**，所有章节都应遵循：
+
+| 决策维度 | 路径1：组织者变更 | 路径2：地点/请求/过期 | 路径3：普通改期 |
+|---------|-----------------|---------------------|----------------|
+| **BookingReference 行为** | 新建 | 新建 | 复用旧的 |
+| **普通预订-Booking 行为** | 新建 | 新建 | 新建 |
+| **座位预订-组织者-新时间段无预订** | 复用旧的 | 复用旧的 | 复用旧的 |
+| **座位预订-组织者-新时间段有预订** | 复用新的 | 复用新的 | 复用新的 |
+
+**关键代码判断**（`EventManager.ts:686-687`）：
+
+```typescript
+const shouldUpdateBookingReferences =
+  !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+
+// 返回值逻辑（EventManager.ts:771-774）
+referencesToCreate: shouldUpdateBookingReferences ? updatedBookingReferences : [...booking.references]
+```
+
+- `shouldUpdateBookingReferences = true` → 新建 BookingReferences
+- `shouldUpdateBookingReferences = false` → 复用旧的 BookingReferences
 
 ---
 
@@ -806,6 +897,7 @@ return {
 | `isBookingRequestedReschedule` | `packages/features/bookings/lib/service/RegularBookingService.ts` | 1669-1672 |
 | `isDailyVideoRoomExpired` | `packages/features/bookings/lib/EventManager.ts` | 677-684 |
 | `shouldUpdateBookingReferences` | `packages/features/bookings/lib/EventManager.ts` | 686-687 |
+| `referencesToCreate` 逻辑 | `packages/features/bookings/lib/EventManager.ts` | 771-774 |
 | `updateLocation` 方法 | `packages/features/bookings/lib/EventManager.ts` | 418-493 |
 
 ### 2.5 参会人通知流程（重排）
@@ -1270,13 +1362,237 @@ if (!newTimeSlotBooking) {
 
 ### 5.4 新记录生成 vs 旧记录复用决策表
 
-| 场景 | 操作类型 | Booking 记录 | Attendee 记录 | BookingSeat 记录 | iCalUID |
-|-----|---------|-------------|---------------|-----------------|---------|
-| 组织者重排座位，新时间段无预订 | 复用 | 更新时间字段 | 不变 | 不变 | 不变 |
-| 组织者重排座位，新时间段有预订 | 合并 | 旧标记为 CANCELLED，复用新的 | 移动（更新 bookingId） | 移动或新建 | 新的不变 |
-| 参会人重排座位，新时间段无预订 | 新建/删除 | 旧可能标记为 CANCELLED，需新建 | 删除旧的，创建新的 | 删除旧的，创建新的 | 新建时生成 |
-| 参会人重排座位，新时间段有预订 | 移动 | 旧可能标记为 CANCELLED，复用新的 | 更新 bookingId | 更新 bookingId | 新的不变 |
-| 普通预订重排 | 新建 | 旧标记为 CANCELLED，创建新的 | 复制或新建 | 新建 | 可能变化 |
+#### 5.4.1 按预订类型分类
+
+##### 座位预订（Seated Booking）
+
+| 场景 | 发起方 | 新时间段有预订？ | Booking 记录 | Attendee 记录 | BookingSeat 记录 | 代码位置 |
+|-----|--------|-----------------|-------------|---------------|-----------------|---------|
+| 复用旧记录 | 组织者 | 否 | 更新 `startTime`, `endTime` | 不变 | 不变 | `moveSeatedBookingToNewTimeSlot.ts:45-126` |
+| 合并预订 | 组织者 | 是 | 旧标记为 `CANCELLED`，复用新的 | 移动（更新 `bookingId`）或删除重复 | 移动或 `upsert` | `combineTwoSeatedBookings.ts:16-163` |
+| 新建预订 | 参会人 | 否 | 返回 `null`，触发 `createNewSeat` 新建 | 删除旧的，创建新的 | 删除旧的，创建新的 | `attendeeRescheduleSeatedBooking.ts:60-67` |
+| 移动参会人 | 参会人 | 是 | 旧可能标记为 `CANCELLED`（最后一个参会人时） | 更新 `bookingId` | 更新 `bookingId` | `attendeeRescheduleSeatedBooking.ts:70-85` |
+
+##### 普通预订（Regular Booking）
+
+| 条件 | Booking 记录 | BookingReference 记录 | iCalUID | 代码位置 |
+|-----|-------------|----------------------|---------|---------|
+| `changedOrganizer = true` | 新建 (`newBookingId`) | **新建** | 可能变化 | `EventManager.ts:706-718` |
+| `isLocationChanged = true` | 新建 (`newBookingId`) | **新建** | 保持不变 | `EventManager.ts:721-724` |
+| `isBookingRequestedReschedule = true` | 新建 (`newBookingId`) | **新建** | 保持不变 | `EventManager.ts:721-724` |
+| `isDailyVideoRoomExpired = true` | 新建 (`newBookingId`) | **新建** | 保持不变 | `EventManager.ts:721-724` |
+| 以上都不满足（普通改期） | 新建 (`newBookingId`) | **复用旧的** | 保持不变 | `EventManager.ts:725-751` |
+
+---
+
+#### 5.4.2 可核验条件对照表
+
+这是一个**可核验**的对照表，每个条件都有明确的代码判断逻辑。
+
+##### 条件1：组织者变更 (`changedOrganizer`)
+
+| 属性 | 值 |
+|-----|-----|
+| **代码定义** | `RegularBookingService.ts:1661-1665` |
+| **判断逻辑** | `!!originalRescheduledBooking && (eventType.schedulingType === ROUND_ROBIN \|\| COLLECTIVE) && originalRescheduledBooking.userId !== evt.organizer.id` |
+| **触发结果** | 创建新的 BookingReference，删除旧日历事件，创建新日历事件 |
+| **Booking 记录** | 新建 |
+| **BookingReference** | 新建 |
+| **iCalUID** | 可能变化 |
+
+**核验点**：
+1. 原预订必须存在：`originalRescheduledBooking` 不为空
+2. 事件类型必须是团队事件：`schedulingType` 为 `ROUND_ROBIN` 或 `COLLECTIVE`
+3. 组织者必须不同：`originalRescheduledBooking.userId !== evt.organizer.id`
+
+---
+
+##### 条件2：会议地点变更 (`isLocationChanged`)
+
+| 属性 | 值 |
+|-----|-----|
+| **代码定义** | `EventManager.ts:675` |
+| **判断逻辑** | `!!evt.location && !!booking.location && evt.location !== booking.location` |
+| **触发结果** | 调用 `updateLocation()`，创建新的视频会议（专用类型），更新日历事件 |
+| **Booking 记录** | 新建 |
+| **BookingReference** | 新建 |
+| **iCalUID** | 保持不变 |
+
+**核验点**：
+1. 新地点存在：`!!evt.location`
+2. 旧地点存在：`!!booking.location`
+3. 地点不同：`evt.location !== booking.location`
+
+**示例场景**：
+- 从 `integrations:zoom` 改为 `integrations:google_meet` ✓
+- 从视频会议改为电话会议 ✓
+- 同一类型不同会议室（如 Zoom 不同链接）？需要看具体实现
+
+---
+
+##### 条件3：请求重排 (`isBookingRequestedReschedule`)
+
+| 属性 | 值 |
+|-----|-----|
+| **代码定义** | `RegularBookingService.ts:1669-1672` |
+| **判断逻辑** | `!!originalRescheduledBooking && !!originalRescheduledBooking.rescheduled && originalRescheduledBooking.status === CANCELLED` |
+| **触发结果** | 调用 `updateLocation()`，创建新的视频会议（专用类型） |
+| **Booking 记录** | 新建 |
+| **BookingReference** | 新建 |
+| **iCalUID** | 保持不变 |
+
+**核验点**：
+1. 原预订存在：`!!originalRescheduledBooking`
+2. 原预订已被重排过：`!!originalRescheduledBooking.rescheduled`
+3. 原预订状态已取消：`originalRescheduledBooking.status === CANCELLED`
+
+**场景说明**：这是"二次重排"场景。原预订 A 被重排为预订 B（此时 A 的 `rescheduled = true`，`status = CANCELLED`），现在要再次重排预订 B，触发此条件。
+
+---
+
+##### 条件4：Daily视频房间过期 (`isDailyVideoRoomExpired`)
+
+| 属性 | 值 |
+|-----|-----|
+| **代码定义** | `EventManager.ts:677-684` |
+| **判断逻辑** | `evt.location === "integrations:daily" && now > (booking.endTime + 14 days)` |
+| **触发结果** | 调用 `updateLocation()`，创建新的 Daily 视频会议 |
+| **Booking 记录** | 新建 |
+| **BookingReference** | 新建 |
+| **iCalUID** | 保持不变 |
+
+**核验点**：
+1. 地点是 Daily.co：`evt.location === "integrations:daily"`
+2. 当前时间超过过期时间：`now > roomExpiryTime`
+3. 过期时间计算：`booking.endTime + 14 * 24 * 60 * 60 * 1000` 毫秒
+
+---
+
+##### 条件5：普通改期（不满足以上任一条件）
+
+| 属性 | 值 |
+|-----|-----|
+| **代码定义** | `EventManager.ts:725-751`（else 分支） |
+| **判断逻辑** | 不满足 `changedOrganizer \|\| isLocationChanged \|\| isBookingRequestedReschedule \|\| isDailyVideoRoomExpired` |
+| **触发结果** | 更新视频会议（专用类型时），更新日历事件，复用旧的 BookingReference |
+| **Booking 记录** | 新建 |
+| **BookingReference** | **复用旧的** |
+| **iCalUID** | 保持不变 |
+
+**核验点**：
+1. `changedOrganizer = false`
+2. `isLocationChanged = false`
+3. `isBookingRequestedReschedule = false`
+4. `isDailyVideoRoomExpired = false`
+
+**关键差异**：`referencesToCreate = [...booking.references]`，复用旧的 references，不创建新的。
+
+---
+
+#### 5.4.3 条件优先级与互斥性
+
+```
+                    ┌────────────────────────────────────────────┐
+                    │         EventManager.reschedule()           │
+                    │            条件判断流程                      │
+                    └────────────────────┬───────────────────────┘
+                                         │
+                                         ▼
+                    ┌────────────────────────────────────────────┐
+                    │  检查 changedOrganizer = true?             │
+                    │  (最高优先级)                                │
+                    └────────────────────┬───────────────────────┘
+                                         │
+                    ┌────────────────────┴───────────────────────┐
+                    │                    │                        │
+                    ▼                    ▼                        │
+            ┌───────────────┐    ┌───────────────────────┐       │
+            │    是         │    │         否            │       │
+            │  (路径1)      │    │  检查以下或条件:       │       │
+            └───────┬───────┘    │  isLocationChanged? │       │
+                    │            │  isBookingRequested? │       │
+                    │            │  isDailyExpired?     │       │
+                    │            └───────────┬───────────┘       │
+                    │                        │                    │
+                    │            ┌───────────┴───────────┐       │
+                    │            │                       │       │
+                    │            ▼                       ▼       │
+                    │    ┌─────────────┐         ┌─────────────┐ │
+                    │    │     是      │         │     否      │ │
+                    │    │   (路径2)   │         │   (路径3)   │ │
+                    │    └──────┬──────┘         └──────┬──────┘ │
+                    │           │                       │       │
+                    └───────────┼───────────────────────┘       │
+                                │                               │
+                                ▼                               ▼
+                    ┌───────────────────────┐         ┌───────────────────────┐
+                    │ BookingReference: 新建 │         │ BookingReference: 复用 │
+                    │ 日历事件: 删除旧的,    │         │ 日历事件: 更新现有事件 │
+                    │         创建新的       │         │                       │
+                    └───────────────────────┘         └───────────────────────┘
+```
+
+---
+
+#### 5.4.4 完整可核验决策表
+
+| 条件1<br>`changedOrganizer` | 条件2<br>`isLocationChanged` | 条件3<br>`isBookingRequested` | 条件4<br>`isDailyExpired` | 路径 | Booking<br>记录 | Booking<br>Reference | iCalUID | 视频会议操作 | 日历事件操作 |
+|-----------------------------|-------------------------------|--------------------------------|---------------------------|-----|-----------------|----------------------|---------|-------------|-------------|
+| **true** | any | any | any | 1 | 新建 | **新建** | 可能变化 | 删除旧的，创建新的 | 删除旧的，创建新的 |
+| **false** | **true** | any | any | 2 | 新建 | **新建** | 不变 | 创建新的（专用类型） | 更新现有事件 |
+| **false** | **false** | **true** | any | 2 | 新建 | **新建** | 不变 | 创建新的（专用类型） | 更新现有事件 |
+| **false** | **false** | **false** | **true** | 2 | 新建 | **新建** | 不变 | 创建新的 | 更新现有事件 |
+| **false** | **false** | **false** | **false** | 3 | 新建 | **复用旧的** | 不变 | 更新现有会议（专用类型） | 更新现有事件 |
+
+**核验说明**：
+- 条件1 (`changedOrganizer`) 具有**最高优先级**，只要为 true，就走路径1
+- 条件2、3、4 是**或关系**，满足任一即走路径2
+- 所有条件都不满足时，走路径3（普通改期）
+
+---
+
+#### 5.4.5 关键字段变化对照表
+
+| 字段 | 路径1: 组织者变更 | 路径2: 地点/请求/过期 | 路径3: 普通改期 |
+|-----|------------------|----------------------|----------------|
+| **booking.id** | 新建（自增） | 新建（自增） | 新建（自增） |
+| **booking.uid** | 新 UUID | 新 UUID | 新 UUID |
+| **booking.iCalUID** | 可能变化 | 保持不变 | 保持不变 |
+| **booking.iCalSequence** | +1 | +1 | +1 |
+| **booking.fromReschedule** | 旧 booking.uid | 旧 booking.uid | 旧 booking.uid |
+| **booking.status (旧)** | CANCELLED | CANCELLED | CANCELLED |
+| **bookingReference.uid** | 新建 | 新建 | **复用旧的** |
+| **bookingReference.type** | 可能变化 | 可能变化 | 不变 |
+| **bookingReference.credentialId** | 可能变化 | 可能变化 | 不变 |
+| **bookingReference.deleted (旧)** | true | true | **false**（复用） |
+
+---
+
+#### 5.4.6 验证方法
+
+要验证某个重排操作走哪条路径，可以：
+
+1. **检查代码中的条件判断**：
+   ```typescript
+   const shouldUpdateBookingReferences =
+     !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+   ```
+   - 如果 `shouldUpdateBookingReferences = true` → 走路径1或路径2
+   - 如果 `shouldUpdateBookingReferences = false` → 走路径3
+
+2. **检查返回值**：
+   ```typescript
+   return {
+     results,
+     referencesToCreate: shouldUpdateBookingReferences ? updatedBookingReferences : [...booking.references],
+   };
+   ```
+   - 如果 `referencesToCreate` 是新生成的 `updatedBookingReferences` → 路径1或路径2
+   - 如果 `referencesToCreate` 是 `[...booking.references]` → 路径3
+
+3. **检查数据库**：
+   - 查看 `BookingReference` 表是否有新记录
+   - 查看旧 `BookingReference` 的 `deleted` 字段是否为 `true`
 
 ---
 
