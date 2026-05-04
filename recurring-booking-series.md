@@ -339,7 +339,341 @@ public async cancelEvent(
 }
 ```
 
-### 3.3 双向同步的关键机制
+### 3.3 外部日历回写机制（外部日历 → Cal.diy）
+
+当用户在外部日历（Google/Apple/Office365）中直接修改或取消事件时，系统通过 `CalendarSyncService` 处理这些回写操作。
+
+**位置**: `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts`
+
+#### 事件筛选与状态判断
+
+系统只处理 Cal.diy 创建的事件，通过 `iCalUID` 的后缀判断：
+
+```typescript
+async handleEvents(
+  selectedCalendar: SelectedCalendar,
+  calendarSubscriptionEvents: CalendarSubscriptionEventItem[]
+) {
+  // 只处理 Cal.com 创建的日历事件
+  const calEvents = calendarSubscriptionEvents.filter((e) =>
+    e.iCalUID?.toLowerCase()?.endsWith("@cal.com")
+  );
+
+  if (calEvents.length === 0) {
+    log.debug("handleEvents: no calendar events to process");
+    return;
+  }
+
+  await Promise.all(
+    calEvents.map((e) => {
+      // 关键判断：根据外部事件状态决定操作类型
+      if (e.status === "cancelled") {
+        // 状态为 cancelled → 触发取消操作
+        return this.cancelBooking(e, selectedCalendar.userId);
+      } else {
+        // 其他状态 → 检查是否需要改期
+        return this.rescheduleBooking(e, selectedCalendar.userId);
+      }
+    })
+  );
+}
+```
+
+#### 触发取消的条件
+
+当外部日历事件的 `status === "cancelled"` 时，系统执行取消操作：
+
+```typescript
+async cancelBooking(event: CalendarSubscriptionEventItem, calendarUserId: number) {
+  // 从 iCalUID 中提取 booking UID
+  // 格式: {booking-uid}@cal.com
+  const [bookingUid] = event.iCalUID?.split("@") ?? [undefined];
+  if (!bookingUid) {
+    log.debug("Unable to sync, booking UID not found in iCalUID");
+    return;
+  }
+
+  // 查找对应的 Booking
+  const booking = await this.deps.bookingRepository.findBookingByUidWithEventType({ bookingUid });
+  if (!booking) {
+    log.debug("Unable to sync, booking not found in database", { bookingUid });
+    return;
+  }
+
+  // 权限检查：确保日历所有者是预约的组织者
+  if (booking.userId !== calendarUserId) {
+    log.debug("Skipping sync, calendar owner is not the booking host", {
+      bookingUid,
+      calendarUserId,
+      bookingUserId: booking.userId,
+    });
+    return;
+  }
+
+  // 执行取消
+  await handleCancelBooking({
+    userId: booking.userId,
+    bookingData: {
+      uid: booking.uid,
+      cancellationReason: "Cancelled on user's calendar",
+      cancelledBy: booking.userPrimaryEmail,
+      // 关键：跳过日历同步，防止回环
+      skipCalendarSyncTaskCancellation: true,
+    },
+  });
+}
+```
+
+#### 触发改期的条件
+
+当外部日历事件状态不为 `cancelled` 时，系统检查时间是否变化，以决定是否执行改期：
+
+```typescript
+async rescheduleBooking(event: CalendarSubscriptionEventItem, calendarUserId: number) {
+  const [bookingUid] = event.iCalUID?.split("@") ?? [undefined];
+  if (!bookingUid) {
+    log.debug("Unable to sync, booking UID not found in iCalUID");
+    return;
+  }
+
+  const booking = await this.deps.bookingRepository.findBookingByUidWithEventType({ bookingUid });
+  if (!booking) {
+    log.debug("Unable to sync, booking not found in database", { bookingUid });
+    return;
+  }
+
+  // 权限检查
+  if (booking.userId !== calendarUserId) {
+    log.debug("Skipping sync, calendar owner is not the booking host", {
+      bookingUid,
+      calendarUserId,
+      bookingUserId: booking.userId,
+    });
+    return;
+  }
+
+  // 关键判断：只有当开始时间变化时才执行改期
+  if (!hasStartTimeChanged(booking, event)) {
+    log.debug("Skipping reschedule, start time has not changed", { bookingUid });
+    return;
+  }
+
+  // 构建改期数据
+  const rescheduleBookingData = buildRescheduleBookingData(booking, event);
+  
+  // 执行改期
+  const { getRegularBookingService } = await import(
+    "@calcom/features/bookings/di/RegularBookingService.container"
+  );
+  const regularBookingService = getRegularBookingService();
+  await regularBookingService.createBooking({
+    bookingData: rescheduleBookingData,
+    bookingMeta: {
+      // 关键：跳过日历同步，防止回环
+      skipCalendarSyncTaskCreation: true,
+      skipAvailabilityCheck: true,
+      skipEventLimitsCheck: true,
+    },
+  });
+}
+
+// 辅助函数：检查开始时间是否变化
+export const hasStartTimeChanged = (
+  booking: BookingWithEventType,
+  event: CalendarSubscriptionEventItem
+): boolean => {
+  if (!event.start) return false;
+  return event.start.getTime() !== booking.startTime.getTime();
+};
+```
+
+#### 回写触发条件汇总表
+
+| 外部日历事件状态 | 系统操作 | 触发条件 |
+|-----------------|---------|---------|
+| `status === "cancelled"` | 取消预约 | 状态明确标记为取消 |
+| `status !== "cancelled"` | 改期预约 | 开始时间发生变化（`startTime` 不同） |
+| `status !== "cancelled"` | 无操作 | 开始时间未变化 |
+
+---
+
+### 3.4 同步回环防护机制
+
+**问题描述**：如果不加以防护，会发生无限循环：
+```
+Cal.diy 创建/取消事件 → 同步到外部日历
+    ↑                                         ↓
+    ←────────── 外部日历 Webhook/轮询通知 ←──
+           (再次触发 Cal.diy 操作)
+```
+
+#### 防护机制 1：`skipCalendarSyncTaskCancellation`
+
+在外部日历回写取消时使用，阻止 `EventManager` 再次向外部日历发送取消请求：
+
+**位置**: `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts:119-129`
+
+```typescript
+await handleCancelBooking({
+  userId: booking.userId,
+  bookingData: {
+    uid: booking.uid,
+    cancellationReason: "Cancelled on user's calendar",
+    cancelledBy: booking.userPrimaryEmail,
+    // 关键：设置为 true，跳过向外部日历的同步
+    skipCalendarSyncTaskCancellation: true,
+  },
+});
+```
+
+**在 handleCancelBooking 中的处理**：
+
+**位置**: `packages/features/bookings/lib/handleCancelBooking.ts:425-463`
+
+```typescript
+// 只有当 skipCalendarSyncTaskCancellation 为 false 时才同步
+if (!skipCalendarSyncTaskCancellation) {
+  try {
+    const eventManager = new EventManager({ ...bookingToDelete.user, credentials }, ...);
+    await eventManager.cancelEvent(
+      evt, 
+      bookingToDelete.references, 
+      isBookingInRecurringSeries
+    );
+  } catch (error) {
+    log.error(`Error deleting integrations`, safeStringify({ error }));
+  }
+}
+```
+
+#### 防护机制 2：`skipCalendarSyncTaskCreation`
+
+在外部日历回写改期时使用，阻止 `EventManager` 再次向外部日历发送创建请求：
+
+**位置**: `packages/features/calendar-subscription/lib/sync/CalendarSyncService.ts:204-213`
+
+```typescript
+await regularBookingService.createBooking({
+  bookingData: buildRescheduleBookingData(booking, event),
+  bookingMeta: {
+    // 关键：设置为 true，跳过向外部日历的同步
+    skipCalendarSyncTaskCreation: true,
+    skipAvailabilityCheck: true,
+    skipEventLimitsCheck: true,
+  },
+});
+```
+
+**在 RegularBookingService 中的处理**：
+
+该参数会传递给 `EventManager`，阻止创建外部日历事件。
+
+#### 完整的同步流程图（含回环防护）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         双向同步与回环防护                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+【方向 1：Cal.diy → 外部日历】
+
+用户在 Cal.diy 操作
+        │
+        ▼
+┌───────────────┐
+│  createBooking │ 或 │ handleCancelBooking │
+│               │
+│  skipCalendarSync │
+│  = false (默认)   │
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ EventManager  │
+│  .create()    │ 或 │ .cancelEvent() │
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│  外部日历 API  │
+│ (Google/Apple/│
+│  Office365)   │
+└───────────────┘
+
+
+【方向 2：外部日历 → Cal.diy（含回环防护）】
+
+用户在外部日历操作
+        │
+        ▼
+┌───────────────────┐
+│ Webhook 或轮询通知 │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│ CalendarSyncService│
+│ .handleEvents()   │
+│                   │
+│ 过滤条件：         │
+│ - iCalUID 以      │
+│   @cal.com 结尾   │
+└─────────┬─────────┘
+          │
+    ┌─────┴─────┐
+    │           │
+    ▼           ▼
+ status=   status!=
+ cancelled  cancelled
+    │           │
+    ▼           ▼
+ cancelBooking  检查时间
+    │         是否变化
+    │           │
+    │      ┌────┴────┐
+    │      │         │
+    │    时间变化   时间不变
+    │      │         │
+    │      ▼         │
+    │  reschedule    │
+    │    Booking     │
+    │      │         │
+    ▼      ▼         │
+┌─────────────────────────┐         │
+│ 关键：设置跳过同步        │         │
+│                         │         │
+│ cancelBooking:          │         │
+│   skipCalendarSyncTask  │         │
+│   Cancellation = true   │         │
+│                         │         │
+│ rescheduleBooking:      │         │
+│   skipCalendarSyncTask  │         │
+│   Creation = true       │         │
+└────────────┬────────────┘         │
+             │                        │
+             ▼                        │
+    ┌─────────────────┐               │
+    │ handleCancel    │               │
+    │ Booking /       │               │
+    │ createBooking   │               │
+    │                 │               │
+    │ 检测到 skip=    │               │
+    │ true，跳过      │               │
+    │ EventManager    │               │
+    │ 外部同步        │               │
+    └────────┬────────┘               │
+             │                        │
+             │                        │
+             ▼                        ▼
+        ┌─────────────────────────────────┐
+        │   防止回环：不再向外部日历发送    │
+        │   操作，循环在此终止             │
+        └─────────────────────────────────┘
+```
+
+---
+
+### 3.5 双向同步的关键机制（Cal.diy → 外部日历）
 
 #### 创建时的同步
 
@@ -347,10 +681,6 @@ public async cancelEvent(
    - 创建 Booking 后，调用 `EventManager.create()`
    - 外部日历返回 `thirdPartyRecurringEventId`（对于重复事件）
    - 存储到 `BookingReference.thirdPartyRecurringEventId`
-
-2. **外部日历 → Cal.diy**：
-   - 通过 Webhook 或轮询监听外部日历变更
-   - 使用 `iCalUID` 或 `externalCalendarId` 匹配 Cal.diy 中的记录
 
 #### 取消时的同步
 
