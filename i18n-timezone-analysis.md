@@ -104,46 +104,65 @@ export const useBookerTime = () => {
 };
 ```
 
-### 1.3 Locale 优先级链
+### 1.3 Locale 优先级链（预订链路实际生效）
+
+**源码依据**：
+- 前端传递 `language` 来自 `i18n.language`（react-i18next 的 `useTranslation` Hook）
+- `bookingCreateBodySchema` 定义 `language` 为必填字符串字段
+- 服务端使用 `getTranslation(language ?? "en", "common")`
+
+**实际优先级链（预订链路）**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Locale 优先级链                                       │
+│              Locale 优先级链（预订链路实际生效）                              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  优先级 1: 请求头 Accept-Language                                           │
+│  优先级 1: 前端 react-i18next 的 i18n.language                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  浏览器或客户端发送的 Accept-Language 头                              │   │
-│  │  由 next-i18next 自动检测                                             │   │
+│  │  代码位置:                                                            │   │
+│  │  - BookEventForm.tsx:149: language: i18n.language                   │   │
+│  │  - useHandleBookEvent.ts:97: language: i18n.language                │   │
+│  │                                                                       │   │
+│  │  i18n.language 由 next-i18next 决定，基于:                           │   │
+│  │  1. URL 路径中的 locale（如 /zh-CN/...）                             │   │
+│  │  2. 浏览器 Accept-Language 头                                         │   │
+│  │  3. 默认 locale（next-i18next.config.js 中的 defaultLocale）         │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                          │
 │                                    ▼                                          │
-│  优先级 2: URL 参数 (?hl=zh-CN 或 ?locale=fr)                               │
+│  优先级 2: 重排时继承原始预订的 locale                                        │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  可以通过 URL 参数强制指定语言                                         │   │
+│  │  代码位置: RegularBookingService.ts:1167-1170                        │   │
+│  │                                                                       │   │
+│  │  const attendeeLanguage = attendeeInfoOnReschedule                   │   │
+│  │    ? attendeeInfoOnReschedule.locale  // 优先使用原始预订的 locale   │   │
+│  │    : language;                        // 否则使用请求中的 language   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                          │
 │                                    ▼                                          │
-│  优先级 3: 登录用户的偏好设置 (User.locale)                                  │
+│  兜底: "en"                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  User 表中的 locale 字段                                              │   │
-│  │  用户设置页面配置的语言                                                │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                    │                                          │
-│                                    ▼                                          │
-│  优先级 4: 活动组织者的语言偏好                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  活动组织者 User.locale                                               │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                    │                                          │
-│                                    ▼                                          │
-│  兜底: "en" (English)                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  代码中多处使用 ?? "en" 作为兜底                                      │   │
+│  │  代码位置: RegularBookingService.ts:1170                              │   │
+│  │  const tAttendees = await getTranslation(attendeeLanguage ?? "en", "common"); │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**⚠️ 不在预订链路生效的参数**：
+
+| 参数 | 说明 | 证据 |
+|------|------|------|
+| `?hl=` URL 参数 | 代码库中无使用 | Grep 搜索 `searchParams.get("hl")` 无结果 |
+| `?locale=` URL 参数 | 代码库中无使用 | Grep 搜索 `searchParams.get("locale")` 无结果 |
+| `User.locale` | 用户设置的语言，但预订链路不直接读取 | 预订时使用 `i18n.language`，不是 `User.locale` |
+| 活动组织者语言 | 仅用于组织者邮件，不影响预订流程 | `tOrganizer` 使用 `organizerUser.locale`，独立于参会者 |
+
+**组织者邮件的 locale 来源**：
+- 代码位置: `RegularBookingService.ts:1158`
+- `const tOrganizer = await getTranslation(organizerUser?.locale ?? "en", "common");`
+- 组织者邮件使用 `User.locale`（用户设置的语言），这是独立于参会者的链路
 
 ### 1.4 冲突处理策略
 
@@ -922,15 +941,16 @@ export function getFormattedDate(calEvent: CalendarEvent, attendee: Person): str
 
 ```typescript
 // 1. 检查时区字符串是否有效
-import { normalizeTimezone, isSupportedTimeZone } from "@calcom/lib/dayjs";
+// 注意: normalizeTimezone 和 isSupportedTimeZone 来自不同的包
+import { normalizeTimezone } from "@calcom/features/calendars/lib/timezone-conversion";
+import { isSupportedTimeZone, isInDST, getDSTDifference } from "@calcom/lib/dayjs";
+import dayjs from "@calcom/dayjs";
 
 const userTimeZone = "America/New_York";
 console.log("Is supported:", isSupportedTimeZone(userTimeZone));
 console.log("Normalized:", normalizeTimezone(userTimeZone));
 
 // 2. 检查时间转换
-import dayjs from "@calcom/dayjs";
-
 const utcTime = "2026-05-16T03:00:00Z";
 const nyTime = dayjs(utcTime).tz("America/New_York");
 const tokyoTime = dayjs(utcTime).tz("Asia/Tokyo");
@@ -984,10 +1004,19 @@ console.log("Is NY previous day from Tokyo?", isPreviousDayInTimezone(time, toky
 // Attendee 表: timeZone, locale
 // User 表: timeZone, locale, timeFormat
 
+// 导入路径
+import { getFormattedDate } from "@calcom/emails/lib/utils/date-formatting";
+import { getTranslation } from "@calcom/i18n/server";
+import type { CalendarEvent, Person } from "@calcom/types/Calendar";
+
+// 首先获取翻译函数
+const t = await getTranslation("ja", "common");
+
 // 检查邮件渲染时的参数
-const emailParams = {
+const emailParams: { calEvent: CalendarEvent; attendee: Person } = {
   calEvent: {
     startTime: "2026-05-16T03:00:00Z", // UTC
+    endTime: "2026-05-16T03:30:00Z", // UTC
     organizer: {
       timeZone: "America/New_York",
       locale: "en",
@@ -995,10 +1024,10 @@ const emailParams = {
     },
   },
   attendee: {
-    timeZone: "Asia/Tokyo",  // 检查这个值
+    timeZone: "Asia/Tokyo",  // 检查这个值 - 参会者时区
     language: {
-      locale: "ja",           // 检查这个值
-      translate: t,
+      locale: "ja",           // 检查这个值 - 参会者语言
+      translate: t,           // 翻译函数
     },
     timeFormat: 24,
   },
@@ -1010,6 +1039,7 @@ const formattedForAttendee = getFormattedDate(
   emailParams.attendee
 );
 console.log("Formatted for attendee:", formattedForAttendee);
+// 预期输出: "12:00 - 12:30, 土曜日, 5月 16, 2026" (东京时间)
 ```
 
 ### 5.2 日志排查要点
