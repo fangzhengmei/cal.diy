@@ -427,24 +427,19 @@ if (evt.location === MeetLocationType && mainHostDestinationCalendar?.integratio
 3. 必须先连接 Google Calendar 才能使用 Google Meet
 4. 没有 Google Calendar 时自动回退到 Cal Video
 
-### 4.5 日历联动：Microsoft Teams
+### 4.5 Microsoft Teams 两种接入路径详解
 
-Microsoft Teams 支持两种接入方式：
-1. **通过 Outlook 日历联动**（推荐）- 与 Google Meet 类似
-2. **直接 Graph API 调用** - 独立的 Online Meetings API
+Microsoft Teams 有两种完全独立的接入路径，**触发条件、行为模式、生命周期管理完全不同**。
 
-#### 方式一：Outlook 日历联动
+#### 路径触发条件
 
-**文件**: `packages/features/bookings/lib/EventManager.ts:334-336`
+**文件**: `packages/features/bookings/lib/EventManager.ts:333-342`
 ```typescript
+const isDedicated = evt.location ? isDedicatedIntegration(evt.location) : null;
 const isMSTeamsWithOutlookCalendar =
   evt.location === MSTeamsLocationType &&
   mainHostDestinationCalendar?.integration === "office365_calendar";
-```
 
-**条件判断**:
-**文件**: `packages/features/bookings/lib/EventManager.ts:341-342`
-```typescript
 // 如果是专用视频集成且不是 Teams + Outlook 组合，才创建独立视频会议
 if (isDedicated && !isMSTeamsWithOutlookCalendar) {
   const result = await this.createVideoEvent(evt);
@@ -452,14 +447,54 @@ if (isDedicated && !isMSTeamsWithOutlookCalendar) {
 }
 ```
 
-**视频数据更新**:
+| 路径 | 触发条件 | 位置类型 | 处理方式 |
+|------|----------|----------|----------|
+| **日历联动路径** | `isMSTeamsWithOutlookCalendar = true` | `MSTeamsLocationType` + `office365_calendar` | 调用 `createAllCalendarEvents()`，**不调用** `createVideoEvent()` |
+| **office365video 直连路径** | `isDedicated = true && !isMSTeamsWithOutlookCalendar` | 专用 video 集成类型 | 调用 `createVideoEvent()` → `videoClient.createMeeting()` |
+
+---
+
+#### 路径一：Outlook 日历联动（推荐）
+
+**触发条件**: `evt.location === "integrations:office365"` 且 `destinationCalendar.integration === "office365_calendar"`
+
+**核心机制**:
+- **不创建独立的视频会议**（`createVideoEvent` 不执行）
+- 只创建 Outlook 日历事件，由 Outlook 自动生成 Teams 会议链接
+- 会议链接存储在 `onlineMeeting.joinUrl` 中
+
+**创建时的行为** (Office365CalendarService.createEvent):
+**文件**: `packages/app-store/office365calendar/lib/CalendarService.ts:300-313`
+```typescript
+const response = await this.fetcher(eventsUrl, {
+  method: "POST",
+  body: JSON.stringify(this.translateEvent(event)),
+});
+
+const responseJson = await handleErrorsJson<
+  NewCalendarEventType & { iCalUId: string; onlineMeeting?: { joinUrl?: string } }
+>(response);
+
+if (responseJson?.onlineMeeting?.joinUrl) {
+  responseJson.url = responseJson?.onlineMeeting?.joinUrl;  // 映射到 url 字段
+}
+```
+
+**translateEvent 中的关键设置**:
+**文件**: `packages/app-store/office365calendar/lib/CalendarService.ts:548-550`
+```typescript
+if (isOnlineMeeting) {
+  office365Event.isOnlineMeeting = true;  // 触发 Outlook 生成 Teams 链接
+}
+```
+
+**视频数据提取**:
 **文件**: `packages/features/bookings/lib/EventManager.ts:251-275`
 ```typescript
 private updateMSTeamsVideoCallData(
   evt: CalendarEvent,
   results: Array<EventResult<Exclude<Event, AdditionalInformation>>>
 ) {
-  // 查找成功创建的 Office 365 日历事件，其中包含 Teams 链接
   const office365CalendarWithTeams = results.find(
     (result) => result.type === "office365_calendar" && result.success && result.createdEvent?.url
   );
@@ -470,68 +505,64 @@ private updateMSTeamsVideoCallData(
       password: "",
       url: office365CalendarWithTeams.createdEvent?.url,
     };
-    // ...
   }
 }
 ```
 
-#### 方式二：直接 Graph API 调用
+---
 
-当用户连接了 Office 365 Video 但没有 Outlook 日历时，使用独立的 VideoApiAdapter。
+#### 路径二：office365video 直连
 
-**文件**: `packages/app-store/office365video/lib/VideoApiAdapter.ts:40-319`
+**触发条件**: 用户连接了 Office 365 Video 凭据，但没有配置 Outlook 日历作为目标日历
 
+**核心机制**:
+- 直接调用 Microsoft Graph API `/onlineMeetings` 端点
+- **不依赖** Outlook 日历
+- 有独立的 `VideoApiAdapter` 实现
+
+**创建时的行为**:
+**文件**: `packages/app-store/office365video/lib/VideoApiAdapter.ts:270-317`
 ```typescript
-const TeamsVideoApiAdapter = (credential: CredentialForCalendarServiceWithTenantId): VideoApiAdapter => {
-  return {
-    createMeeting: async (event: CalendarEvent): Promise<VideoCallData> => {
-      // 1. 构建 Graph API 端点
-      const url = `${await getUserEndpoint()}/onlineMeetings`;
-      
-      // 2. 转换事件格式
-      const body = {
-        startDateTime: event.startTime,
-        endDateTime: event.endTime,
-        subject: event.title,
-      };
-
-      // 3. 调用 Microsoft Graph API
-      const response = await auth.requestRaw({
-        url,
-        options: {
-          method: "POST",
-          body: JSON.stringify(body),
-        },
-      });
-
-      // 4. 解析响应
-      const resultObject = JSON.parse(await response.text());
-
-      return {
-        type: "office365_video",
-        id: resultObject.id,
-        password: "",
-        url: resultObject.joinWebUrl || resultObject.joinUrl,
-      };
+createMeeting: async (event: CalendarEvent): Promise<VideoCallData> => {
+  const url = `${await getUserEndpoint()}/onlineMeetings`;
+  const response = await auth.requestRaw({
+    url,
+    options: {
+      method: "POST",  // POST 创建新会议
+      body: JSON.stringify(translateEvent(event)),
     },
-    // ... 其他方法
-  };
-};
-```
+  });
 
-**用户端点确定**:
-**文件**: `packages/app-store/office365video/lib/VideoApiAdapter.ts:218-223`
-```typescript
-async function getUserEndpoint(): Promise<string> {
-  const azureUserId = await getAzureUserId(credential);
-  return azureUserId
-    ? `https://graph.microsoft.com/v1.0/users/${azureUserId}`
-    : "https://graph.microsoft.com/v1.0/me";
-}
+  const resultObject = JSON.parse(await response.text());
+
+  return Promise.resolve({
+    type: "office365_video",
+    id: resultObject.id,
+    password: "",
+    url: resultObject.joinWebUrl || resultObject.joinUrl,
+  });
+},
 ```
 
 **委托凭据支持**:
-Teams Video 特别支持委托凭据（Delegation Credential），用于组织级别的服务账户集成。
+office365video 直连路径特别支持委托凭据（Delegation Credential），用于组织级别的服务账户集成。通过 `getAzureUserId()` 函数查找目标用户的 Azure AD ID，然后使用服务账户代表用户创建会议。
+
+---
+
+#### 两种路径关键对比
+
+| 维度 | 日历联动路径 | office365video 直连路径 |
+|------|-------------|------------------------|
+| **触发条件** | `MSTeamsLocationType` + `office365_calendar` | 专用 video 集成，无 Outlook 日历 |
+| **API 调用** | `POST /calendar/events` | `POST /onlineMeetings` |
+| **会议生成** | Outlook 自动生成 | 直接调用 Graph API |
+| **链接存储** | `onlineMeeting.joinUrl` → `url` | `joinWebUrl` / `joinUrl` |
+| **推荐程度** | ⭐⭐⭐ 推荐 | ⭐ 不推荐 |
+
+**为什么不推荐直连路径**：
+- 改期时会创建新会议（链接变化）
+- 取消时不会删除会议（会议残留）
+- 详见第 8.3 节和第 9.3 节的详细分析
 
 ### 4.6 其他支持的 Provider
 
