@@ -446,58 +446,367 @@ const lastAttendeeDeleteBooking = async (
 
 ### 2.4 外部日历更新机制（重排）
 
-重排时的日历更新通过 `EventManager.reschedule()` 方法实现，位置在 `EventManager.ts:615-775`。
+重排时的日历更新通过 `EventManager.reschedule()` 方法实现，位置在 `EventManager.ts:615-775`。根据代码逻辑，重排时的外部日历更新分为**三条明确的路径**。
 
-#### 核心逻辑
+---
+
+#### 路径1：组织者变更 (Changed Organizer)
+
+##### 判断条件
+
+在 `RegularBookingService.ts:1661-1665` 中：
 
 ```typescript
-public async reschedule(
-  event: CalendarEvent,
-  rescheduleUid: string,
-  newBookingId?: number,
-  changedOrganizer?: boolean,
-  previousHostDestinationCalendar?: DestinationCalendar[] | null,
-  isBookingRequestedReschedule?: boolean,
-  skipDeleteEventsAndMeetings?: boolean
-): Promise<CreateUpdateResult> {
-  // 获取原预订信息
-  const booking = await prisma.booking.findUnique({
-    where: { uid: rescheduleUid },
-    select: { ... }
-  });
+const changedOrganizer =
+  !!originalRescheduledBooking &&
+  (eventType.schedulingType === SchedulingType.ROUND_ROBIN ||
+    eventType.schedulingType === SchedulingType.COLLECTIVE) &&
+  originalRescheduledBooking.userId !== evt.organizer.id;
+```
 
-  // 判断是否需要重新创建事件
-  const shouldRecreateEvent =
-    !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+**同时满足以下三个条件**：
 
-  if (evt.requiresConfirmation) {
-    // 需要确认的重排：先删除旧事件，等待确认后再创建
-    if (!skipDeleteEventsAndMeetings) {
-      await this.deleteEventsAndMeetings({ ... });
-    }
-  } else if (shouldRecreateEvent) {
-    // 组织者变化或位置变化：删除旧事件，创建新事件
-    if (!skipDeleteEventsAndMeetings) {
-      await this.deleteEventsAndMeetings({ ... });
-    }
-    const createdEvent = await this.create(originalEvt);
-    results.push(...createdEvent.results);
-  } else {
-    // 普通重排：更新现有事件
-    const updatedEvents = await this.updateEvents(evt, booking, rescheduleUid);
-    results.push(...updatedEvents.results);
+| 条件 | 代码判断 | 说明 |
+|-----|---------|------|
+| 存在原预订 | `!!originalRescheduledBooking` | 必须是重排操作，不是新建 |
+| 团队事件类型 | `ROUND_ROBIN` 或 `COLLECTIVE` | 轮询或集体事件才可能有组织者变更 |
+| 组织者不同 | `originalRescheduledBooking.userId !== evt.organizer.id` | 原预订的组织者与新事件组织者不同 |
+
+##### 处理逻辑
+
+在 `EventManager.ts:706-718` 中：
+
+```typescript
+if (changedOrganizer) {
+  if (!skipDeleteEventsAndMeetings) {
+    log.debug("RescheduleOrganizerChanged: Deleting Event and Meeting for previous booking");
+    // 删除旧组织者日历中的事件和视频会议
+    await this.deleteEventsAndMeetings({
+      event: { ...event, destinationCalendar: previousHostDestinationCalendar },
+      bookingReferences: booking.references,
+    });
   }
+
+  log.debug("RescheduleOrganizerChanged: Creating Event and Meeting for for new booking");
+  // 在新组织者日历中创建新的事件和视频会议
+  const createdEvent = await this.create(originalEvt);
+  results.push(...createdEvent.results);
+  updatedBookingReferences.push(...createdEvent.referencesToCreate);
 }
 ```
 
-#### 重排时的日历更新策略
+##### 操作总结
 
-| 场景 | 策略 | 说明 |
-|-----|------|------|
-| 需要确认的重排 | 删除旧事件，等待确认 | 组织者需要确认后才创建新事件 |
-| 组织者变化 | 删除旧事件，创建新事件 | 不同组织者的日历不同 |
-| 位置变化 | 删除旧事件，创建新事件 | 视频会议链接可能变化 |
-| 普通重排 | 更新现有事件 | 只修改时间，保持 iCalUID 不变 |
+| 操作 | 说明 |
+|-----|------|
+| **删除旧事件** | 从原组织者的日历中删除事件和视频会议 |
+| **创建新事件** | 在新组织者的日历中创建新的事件和视频会议 |
+| **新建 BookingReferences** | 使用新创建的 references，不复用旧的 |
+
+**关键原因**：不同组织者有不同的日历凭证和目标日历，无法"更新"现有事件，只能删除旧的并创建新的。
+
+---
+
+#### 路径2：会议地点变更 / 请求重排 / Daily房间过期
+
+##### 判断条件
+
+这是一个**或条件**，满足任一即可：
+
+###### 条件2a：会议地点变更
+
+在 `EventManager.ts:675` 中：
+
+```typescript
+const isLocationChanged = !!evt.location && !!booking.location && evt.location !== booking.location;
+```
+
+| 条件 | 说明 |
+|-----|------|
+| 新地点存在 | `!!evt.location` |
+| 旧地点存在 | `!!booking.location` |
+| 地点不同 | `evt.location !== booking.location` |
+
+**示例场景**：
+- 从 `integrations:zoom` 改为 `integrations:google_meet`
+- 从视频会议改为电话会议
+- 会议地点类型变化
+
+###### 条件2b：请求重排 (Booking Requested Reschedule)
+
+在 `RegularBookingService.ts:1669-1672` 中：
+
+```typescript
+const isBookingRequestedReschedule =
+  !!originalRescheduledBooking &&
+  !!originalRescheduledBooking.rescheduled &&
+  originalRescheduledBooking.status === BookingStatus.CANCELLED;
+```
+
+| 条件 | 说明 |
+|-----|------|
+| 存在原预订 | `!!originalRescheduledBooking` |
+| 原预订已被重排过 | `!!originalRescheduledBooking.rescheduled` |
+| 原预订状态已取消 | `originalRescheduledBooking.status === CANCELLED` |
+
+**场景说明**：这是一个"二次重排"场景。原预订已经被重排过一次（状态为 CANCELLED，rescheduled 为 true），现在要再次重排。
+
+###### 条件2c：Daily视频房间过期
+
+在 `EventManager.ts:677-684` 中：
+
+```typescript
+let isDailyVideoRoomExpired = false;
+if (evt.location === "integrations:daily") {
+  const originalBookingEndTime = new Date(booking.endTime);
+  // Daily.co 房间在会议结束后 14 天过期
+  const roomExpiryTime = new Date(originalBookingEndTime.getTime() + 14 * 24 * 60 * 60 * 1000);
+  const now = new Date();
+  isDailyVideoRoomExpired = now > roomExpiryTime;
+}
+```
+
+| 条件 | 说明 |
+|-----|------|
+| 地点是 Daily.co | `evt.location === "integrations:daily"` |
+| 当前时间超过过期时间 | `now > roomExpiryTime`（结束时间 + 14 天） |
+
+##### 处理逻辑
+
+在 `EventManager.ts:721-724` 中：
+
+```typescript
+if (isLocationChanged || isBookingRequestedReschedule || isDailyVideoRoomExpired) {
+  const updatedLocation = await this.updateLocation(evt, booking);
+  results.push(...updatedLocation.results);
+  updatedBookingReferences.push(...updatedLocation.referencesToCreate);
+}
+```
+
+##### `updateLocation` 方法详解
+
+在 `EventManager.ts:418-493` 中：
+
+```typescript
+public async updateLocation(event: CalendarEvent, booking: PartialBooking): Promise<CreateUpdateResult> {
+  const evt = processLocation(event);
+  const isDedicated = evt.location ? isDedicatedIntegration(evt.location) : null;
+
+  const results: Array<EventResult<Exclude<Event, AdditionalInformation>>> = [];
+  
+  // 1. 如果是专用会议类型，创建新的视频会议
+  if (isDedicated) {
+    const result = await this.createVideoEvent(evt);
+    if (result.createdEvent) {
+      evt.videoCallData = result.createdEvent;
+      evt.location = result.originalEvent.location;
+      result.type = result.createdEvent.type;
+    }
+    results.push(result);
+  }
+
+  // 2. 更新日历事件（使用新的视频会议数据）
+  const calendarReference = booking.references.find((reference) => reference.type.includes("_calendar"));
+  if (calendarReference) {
+    results.push(...(await this.updateAllCalendarEvents(evt, booking)));
+    
+    if (evt.location === MSTeamsLocationType) {
+      this.updateMSTeamsVideoCallData(evt, results);
+    }
+  }
+
+  // 3. 返回新的 references
+  const referencesToCreate = results.map((result) => {
+    const updatedEvent = Array.isArray(result.updatedEvent) ? result.updatedEvent[0] : result.updatedEvent;
+    const createdEvent = result.createdEvent;
+    let event = updatedEvent;
+    if (!event) event = createdEvent;
+
+    return {
+      type: result.type,
+      uid: event?.id?.toString() ?? "",
+      meetingId: event?.id?.toString(),
+      meetingPassword: event?.password,
+      meetingUrl: event?.url,
+      externalCalendarId: result.externalId,
+      ...(result.credentialId && result.credentialId > 0 ? { credentialId: result.credentialId } : {}),
+    };
+  });
+
+  return {
+    results,
+    referencesToCreate,
+  };
+}
+```
+
+##### 操作总结
+
+| 条件 | 视频会议操作 | 日历事件操作 | BookingReferences |
+|-----|------------|------------|------------------|
+| 地点变更 | 创建新的视频会议（如果是专用类型） | 更新日历事件 | **新建** |
+| 请求重排 | 创建新的视频会议（如果是专用类型） | 更新日历事件 | **新建** |
+| Daily房间过期 | 创建新的视频会议 | 更新日历事件 | **新建** |
+
+**关键原因**：
+- 地点变更可能意味着视频会议类型变化，需要创建新的会议链接
+- Daily.co 房间有有效期，过期后无法复用，必须创建新的
+- 请求重排场景比较复杂，保守选择创建新的 references
+
+---
+
+#### 路径3：普通改期
+
+##### 判断条件
+
+**不满足以下任一条件**：
+- `changedOrganizer = false`（组织者未变更）
+- `isLocationChanged = false`（地点未变更）
+- `isBookingRequestedReschedule = false`（不是请求重排）
+- `isDailyVideoRoomExpired = false`（Daily 房间未过期）
+
+**典型场景**：
+- 只是把会议时间从明天 10:00 改到后天 14:00
+- 组织者、地点、房间都没有变化
+
+##### 处理逻辑
+
+在 `EventManager.ts:725-751` 中：
+
+```typescript
+} else {
+  const isDedicated = evt.location ? isDedicatedIntegration(evt.location) : null;
+  
+  // 1. 如果是专用会议类型，更新视频会议（不是创建新的）
+  if (isDedicated) {
+    const result = await this.updateVideoEvent(evt, booking);
+    const [updatedEvent] = Array.isArray(result.updatedEvent)
+      ? result.updatedEvent
+      : [result.updatedEvent];
+
+    if (updatedEvent) {
+      evt.videoCallData = updatedEvent;
+      evt.location = updatedEvent.url;
+    }
+    results.push(result);
+  }
+
+  // 2. 更新日历事件
+  const bookingCalendarReference = booking.references.find((reference) =>
+    reference.type.includes("_calendar")
+  );
+  if (bookingCalendarReference) {
+    results.push(...(await this.updateAllCalendarEvents(evt, booking, newBookingId)));
+  }
+
+  // 3. 更新 CRM 事件
+  results.push(...(await this.updateAllCRMEvents(evt, booking)));
+}
+```
+
+##### 关键差异：复用旧的 BookingReferences
+
+在 `EventManager.ts:771-774` 中：
+
+```typescript
+const shouldUpdateBookingReferences =
+  !!changedOrganizer || isLocationChanged || !!isBookingRequestedReschedule || isDailyVideoRoomExpired;
+
+return {
+  results,
+  // 普通改期时，shouldUpdateBookingReferences = false，复用旧的 references
+  referencesToCreate: shouldUpdateBookingReferences ? updatedBookingReferences : [...booking.references],
+};
+```
+
+##### 操作总结
+
+| 操作 | 说明 |
+|-----|------|
+| **更新视频会议** | 专用会议类型时，更新现有会议（不是创建新的） |
+| **更新日历事件** | 修改现有事件的时间，保持 iCalUID 不变 |
+| **更新 CRM 事件** | 更新 CRM 系统中的事件 |
+| **复用 BookingReferences** | 使用旧的 `booking.references`，不创建新的 |
+
+**关键原因**：
+- 只是时间变更，日历事件可以通过 PATCH 操作更新
+- 视频会议链接通常保持不变，只需更新会议时间
+- 复用 references 更高效，避免不必要的数据库操作
+
+---
+
+#### 三条路径决策流程图
+
+```
+                    ┌─────────────────────────┐
+                    │  EventManager.reschedule │
+                    │      被调用              │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────┐
+              │  evt.requiresConfirmation = true? │
+              └───────────┬─────────────────────┘
+                          │
+              ┌───────────┴───────────┐
+              │ 是                     │ 否
+              ▼                       ▼
+    ┌─────────────────┐    ┌──────────────────────────────┐
+    │ 路径0: 需要确认 │    │ 检查三条路径的判断条件        │
+    │ - 删除旧事件    │    │ - changedOrganizer?          │
+    │ - 等待确认后创建│    │ - isLocationChanged?         │
+    │ (组织者确认时处理)│   │ - isBookingRequestedReschedule? │
+    └─────────────────┘    │ - isDailyVideoRoomExpired?  │
+                           └──────────────┬───────────────┘
+                                          │
+                      ┌───────────────────┼───────────────────┐
+                      │                   │                   │
+                      ▼                   ▼                   ▼
+            ┌───────────────┐   ┌────────────────┐   ┌───────────────┐
+            │ 路径1:组织者  │   │ 路径2:地点变更/ │   │ 路径3:普通改期 │
+            │ 变更          │   │ 请求重排/      │   │ (不满足以上)   │
+            └───────┬───────┘   │ Daily房间过期  │   └───────┬───────┘
+                    │           └───────┬────────┘           │
+                    │                   │                    │
+                    ▼                   ▼                    ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                         操作对比                                  │
+    ├───────────────┬────────────────┬─────────────────────────────────┤
+    │     路径1     │     路径2      │            路径3                │
+    ├───────────────┼────────────────┼─────────────────────────────────┤
+    │ 删除旧事件    │ 创建新视频会议 │ 更新视频会议(专用类型)          │
+    │ 创建新事件    │ 更新日历事件   │ 更新日历事件                    │
+    │ 新建References│ 新建References │ 复用旧References                │
+    └───────────────┴────────────────┴─────────────────────────────────┘
+```
+
+---
+
+#### 三条路径详细对照表
+
+| 判断维度 | 路径1：组织者变更 | 路径2：地点变更/请求重排/Daily过期 | 路径3：普通改期 |
+|---------|-----------------|-----------------------------------|----------------|
+| **判断条件** | `changedOrganizer = true` | `isLocationChanged \|\| isBookingRequestedReschedule \|\| isDailyVideoRoomExpired` | 以上都不满足 |
+| **组织者变化** | 是 | 否 | 否 |
+| **地点变化** | 可能 | 是（或其他条件） | 否 |
+| **视频会议操作** | 删除旧的，创建新的 | 创建新的（专用类型时） | 更新现有会议 |
+| **日历事件操作** | 删除旧的，创建新的 | 更新现有事件 | 更新现有事件 |
+| **iCalUID** | 变化（新事件） | 保持不变 | 保持不变 |
+| **BookingReferences** | **新建** | **新建** | **复用旧的** |
+| **适用场景** | 团队事件组织者变更 | 视频会议类型变化、二次重排、Daily房间过期 | 只是时间变更 |
+
+---
+
+#### 关键代码位置索引
+
+| 条件判断 | 文件位置 | 代码行 |
+|---------|---------|--------|
+| `changedOrganizer` | `packages/features/bookings/lib/service/RegularBookingService.ts` | 1661-1665 |
+| `isLocationChanged` | `packages/features/bookings/lib/EventManager.ts` | 675 |
+| `isBookingRequestedReschedule` | `packages/features/bookings/lib/service/RegularBookingService.ts` | 1669-1672 |
+| `isDailyVideoRoomExpired` | `packages/features/bookings/lib/EventManager.ts` | 677-684 |
+| `shouldUpdateBookingReferences` | `packages/features/bookings/lib/EventManager.ts` | 686-687 |
+| `updateLocation` 方法 | `packages/features/bookings/lib/EventManager.ts` | 418-493 |
 
 ### 2.5 参会人通知流程（重排）
 
