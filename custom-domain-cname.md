@@ -1798,4 +1798,328 @@ NEXT_PUBLIC_WEBAPP_URL=http://localhost:3000
 | `PROJECT_ID_VERCEL` | String | ❌ | Vercel 项目 ID |
 | `TEAM_ID_VERCEL` | String | ❌ | Vercel 团队 ID |
 | `AUTH_BEARER_TOKEN_VERCEL` | String | ❌ | Vercel API Token |
-| `VERCEL_URL` | URL |
+| `VERCEL_URL` | URL | ❌ | Vercel 内部部署 URL |
+| **Cloudflare 集成** | | | |
+| `CLOUDFLARE_ZONE_ID` | String | ❌ | Cloudflare 区域 ID |
+| `CLOUDFLARE_VERCEL_CNAME` | String | ❌ | CNAME 目标（如 `cname.vercel-dns.com`）|
+| `AUTH_BEARER_TOKEN_CLOUDFLARE` | String | ❌ | Cloudflare API Token |
+| `CLOUDFLARE_DNS` | 0/1 | ❌ | 启用 Cloudflare DNS 管理 |
+
+### 5.2 配置示例
+
+#### 5.2.1 SaaS 多租户平台完整配置
+
+```bash
+# =============================================================================
+# 核心配置
+# =============================================================================
+NEXT_PUBLIC_WEBAPP_URL=https://app.cal.com
+NEXTAUTH_URL=https://app.cal.com/api/auth
+NEXTAUTH_SECRET=your-super-secret-key-min-32-characters
+CALENDSO_ENCRYPTION_KEY=your-32-char-encryption-key-here
+
+# =============================================================================
+# 组织功能
+# =============================================================================
+ORGANIZATIONS_ENABLED=1
+RESERVED_SUBDOMAINS=app,www,api,admin,mail,smtp,docs,status
+
+# =============================================================================
+# Cookie 配置 - 实现跨子域名单点登录
+# =============================================================================
+NEXTAUTH_COOKIE_DOMAIN=.cal.com
+
+# =============================================================================
+# Vercel 集成 - 自动 SSL 证书管理
+# =============================================================================
+PROJECT_ID_VERCEL=prj_abc123def456
+TEAM_ID_VERCEL=team_xyz789
+AUTH_BEARER_TOKEN_VERCEL=vercel-api-token-here
+VERCEL_URL=cal-com.vercel.app
+
+# =============================================================================
+# Cloudflare 集成 - DNS 管理
+# =============================================================================
+CLOUDFLARE_ZONE_ID=your-cloudflare-zone-id
+CLOUDFLARE_VERCEL_CNAME=cname.vercel-dns.com
+AUTH_BEARER_TOKEN_CLOUDFLARE=cloudflare-api-token-here
+CLOUDFLARE_DNS=1
+```
+
+#### 5.2.2 单组织自托管完整配置
+
+```bash
+# =============================================================================
+# 核心配置
+# =============================================================================
+NEXT_PUBLIC_WEBAPP_URL=https://cal.company.com
+NEXTAUTH_URL=https://cal.company.com/api/auth
+NEXTAUTH_SECRET=your-super-secret-key-min-32-characters
+CALENDSO_ENCRYPTION_KEY=your-32-char-encryption-key-here
+
+# =============================================================================
+# 单组织模式
+# =============================================================================
+ORGANIZATIONS_ENABLED=1
+NEXT_PUBLIC_SINGLE_ORG_SLUG=company
+
+# =============================================================================
+# Cookie 配置（可选，单域名不需要）
+# =============================================================================
+# NEXTAUTH_COOKIE_DOMAIN=.company.com
+
+# =============================================================================
+# Vercel 集成（可选，如果使用 Vercel 部署）
+# =============================================================================
+# PROJECT_ID_VERCEL=prj_abc123def456
+# AUTH_BEARER_TOKEN_VERCEL=vercel-api-token-here
+# VERCEL_URL=cal-company.vercel.app
+```
+
+---
+
+## 附录 A：关键发现总结
+
+### A.1 Host 路由规则边界
+
+| 发现项 | 说明 |
+|--------|------|
+| **正则匹配** | 多组织模式使用 `^(?<orgSlug>(?!app)[^.]+)\.(?!vercel\.app).*` |
+| **主应用排除** | `(?!app)` 负向前瞻确保 `app.cal.com` 不被匹配 |
+| **Vercel 内部排除** | `(?!vercel\.app)` 排除内部部署域名 |
+| **单组织模式** | 正则为 `.*`，所有域名都被视为组织域名 |
+| **路由优先级** | `beforeFiles` 阶段，优先级高于文件系统路由 |
+| **保留路径** | `_next`, `_trpc`, `bookings`, `settings` 等自动排除 |
+
+### A.2 SSL 证书管理边界
+
+| 能力 | 代码可控 | 平台托管 | 说明 |
+|------|----------|----------|------|
+| 添加域名到项目 | ✅ | - | Vercel API 调用 |
+| 删除域名 | ✅ | - | Vercel API 调用 |
+| 添加 CNAME 记录 | ✅ | - | Cloudflare API 调用 |
+| 域名所有权验证 | ❌ | ✅ | Vercel 自动处理 |
+| SSL 证书申请 | ❌ | ✅ | Vercel 自动申请 |
+| SSL 证书续期 | ❌ | ✅ | Vercel 到期前 30 天自动续期 |
+| 证书状态查询 | ❌ | ✅ | 只能通过 Vercel Dashboard |
+| 证书到期时间 | ❌ | ✅ | 代码无法获取 |
+
+### A.3 OAuth 回调校验问题
+
+| 校验点 | 规则 | 问题 |
+|--------|------|------|
+| `redirect_uri` 匹配 | **精确字符串比较** | 反向代理修改 Host/协议会导致不匹配 |
+| 登录回调 URL | 仅 `WEBAPP_URL.hostname` | 组织子域名用户登录后被重定向到主域名 |
+| `getSafeRedirectUrl` | 精确 `origin` 匹配 | 组织子域名不在白名单中 |
+| `isSafeUrlToLoadResourceFrom` | TLD+1 匹配 | 允许组织子域名，但自定义域名不允许 |
+| NextAuth 回调路径 | 仅 `http://` 或 `https://` 开头 | 防止协议相对 URL 攻击 |
+
+### A.4 Cookie 与会话边界
+
+| 配置项 | 默认值 | 跨子域名 | 说明 |
+|--------|--------|----------|------|
+| `domain` | `undefined`（精确匹配）| ❌ | 设置 `.cal.com` 可实现跨子域名 |
+| `sameSite` | HTTPS: `none`, HTTP: `lax` | ✅/❌ | `none` 需要同时设置 `Secure` |
+| `secure` | HTTPS: `true`, HTTP: `false` | - | 反向代理 HTTP 转发会导致问题 |
+| `httpOnly` | `true`（会话相关）| - | 防止 XSS 攻击 |
+| `__Secure-` 前缀 | HTTPS 自动添加 | - | 增强安全性，防止 HTTP 覆盖 |
+
+---
+
+## 附录 B：已知问题与建议
+
+### B.1 已知问题
+
+1. **登录后重定向问题**
+   - 组织子域名用户登录后会被重定向到 `WEBAPP_URL`
+   - 原因：`getSafeRedirectUrl` 白名单机制
+   - 影响：用户体验差，需要手动返回组织域名
+
+2. **自定义域名 OAuth 回调问题**
+   - 完全自定义域名（如 `cal.company.com`）无法使用现有 OAuth 集成
+   - 原因：回调 URL 硬编码为 `WEBAPP_URL`
+   - 影响：企业用户无法在自定义域名下连接日历等服务
+
+3. **Cookie 前缀导致的开发环境问题**
+   - HTTPS 环境 Cookie 名带 `__Secure-` 前缀
+   - HTTP 开发环境不带前缀
+   - 影响：开发/生产环境 Cookie 不兼容
+
+4. **域名状态无法监控**
+   - 代码无法查询 SSL 证书状态
+   - 无法获知证书何时过期
+   - 影响：故障排查困难
+
+### B.2 改进建议
+
+1. **扩展 `getSafeRedirectUrl` 支持组织域名**
+   - 使用 TLD+1 匹配而非精确 origin
+   - 或添加组织域名到动态白名单
+
+2. **实现主域名统一 OAuth 回调**
+   - 在 `state` 参数中编码 `orgSlug`
+   - 回调后重定向回组织域名
+
+3. **添加域名状态监控**
+   - 实现健康检查探测 SSL 可用性
+   - 定期查询 Certificate Transparency 日志
+
+4. **支持自定义域名**
+   - 实现反向代理感知
+   - 信任 `X-Forwarded-*` 头
+   - 动态构建 `redirect_uri`
+
+---
+
+## 6. 收尾总结：企业自定义域名绑定全景视图
+
+### 6.1 核心架构全景
+
+Cal.diy 企业用户绑定自定义域名的技术栈呈现出**三层边界**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           企业自定义域名请求                                    │
+│                    (如: https://cal.acme.com/john/30min)                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      第一层：Host 路由规则边界                                  │
+│                                                                               │
+│  匹配规则（多组织模式）:                                                        │
+│    正则: ^(?<orgSlug>(?!app)[^.]+)\.(?!vercel\.app).*                      │
+│                                                                               │
+│  边界条件:                                                                     │
+│  ✅ 匹配: acme.cal.com → orgSlug = "acme"                                    │
+│  ❌ 不匹配: app.cal.com → 主应用域名被 (?!app) 排除                           │
+│  ❌ 不匹配: cal-com.vercel.app → 内部域名被排除                                │
+│                                                                               │
+│  路由优先级: beforeFiles 阶段（最高优先级）                                    │
+│  重写目标: /org/{orgSlug}/{user}/{type}                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      第二层：SSL 证书管理边界                                  │
+│                                                                               │
+│  代码可控范围（API 调用）:                                                     │
+│  ✅ 调用 Vercel API 添加/删除域名                                             │
+│  ✅ 调用 Cloudflare API 添加/删除 CNAME 记录                                  │
+│  ✅ 处理已知错误码（forbidden, domain_taken, record_exists）                  │
+│                                                                               │
+│  平台托管范围（黑盒）:                                                         │
+│  ❌ 域名所有权验证（DNS/HTTP）                                                │
+│  ❌ SSL 证书申请（Let's Encrypt）                                             │
+│  ❌ SSL 证书自动续期（到期前 30 天）                                          │
+│  ❌ 证书状态查询（只能通过 Vercel Dashboard）                                  │
+│  ❌ 证书到期时间（代码无法获取）                                               │
+│                                                                               │
+│  关键发现: 代码只能验证 API 调用成功，无法获知 SSL 证书是否已签发。             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      第三层：OAuth 与 Cookie 边界                              │
+│                                                                               │
+│  OAuth 回调校验规则:                                                          │
+│  ⚠️ redirect_uri: 精确字符串比较（反向代理修改 Host/协议会导致不匹配）          │
+│  ⚠️ 登录回调 URL: 仅允许 WEBAPP_URL.hostname                                  │
+│  ⚠️ getSafeRedirectUrl: 精确 origin 匹配（组织子域名不在白名单）                │
+│  ⚠️ 不一致性: isSafeUrlToLoadResourceFrom 使用 TLD+1 匹配（允许组织子域名）   │
+│                                                                               │
+│  Cookie 与会话边界:                                                           │
+│  ✅ NEXTAUTH_COOKIE_DOMAIN: 设置 .cal.com 可实现跨子域名共享                  │
+│  ⚠️ sameSite: HTTPS 环境为 none（需同时设置 Secure）                         │
+│  ⚠️ secure: 基于 WEBAPP_URL 静态判断，非实际请求协议                          │
+│  ⚠️ __Secure- 前缀: HTTPS 自动添加，增强安全性但导致开发/生产环境不兼容         │
+│                                                                               │
+│  关键发现: 组织子域名用户登录后会被重定向到 WEBAPP_URL，用户体验差。            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 关键边界速查表
+
+| 维度 | 代码可控 | 平台托管 | 关键边界 |
+|------|----------|----------|----------|
+| **Host 路由** | ✅ Next.js Rewrites 配置 | - | `(?!app)` 排除主应用域名 |
+| **CNAME 配置** | ✅ Cloudflare API | - | 仅能添加/删除，无法验证 |
+| **域名添加** | ✅ Vercel API | - | 仅能添加/删除，无法验证 |
+| **SSL 申请** | ❌ | ✅ Vercel 自动 | 代码无法获知状态 |
+| **SSL 续期** | ❌ | ✅ 到期前 30 天 | 代码无法获知状态 |
+| **OAuth redirect_uri** | ✅ 精确匹配规则 | - | 反向代理会破坏匹配 |
+| **登录回调 URL** | ✅ 白名单规则 | - | 组织子域名被排除 |
+| **Cookie domain** | ✅ 环境变量配置 | - | 默认不跨子域名 |
+| **Cookie sameSite** | ✅ 环境变量配置 | - | none 需要 Secure |
+
+### 6.3 企业自定义域名部署决策树
+
+```
+企业需要绑定自定义域名（如: cal.company.com）
+                  │
+                  ▼
+        ┌─────────────────┐
+        │ 使用哪种部署方式？│
+        └─────────────────┘
+           │           │
+           ▼           ▼
+    单组织模式      多组织 SaaS 模式
+           │           │
+           ▼           ▼
+    设置环境变量    配置 Vercel + Cloudflare
+    NEXT_PUBLIC_     集成
+    SINGLE_ORG_SLUG
+           │           │
+           ▼           ▼
+    所有域名路由    企业域名 CNAME 到
+    到指定组织      Vercel 部署域名
+           │           │
+           ▼           ▼
+    ┌─────────────────────────────┐
+    │ 必须处理的问题：              │
+    │                              │
+    │ 1. Cookie 会话连续性          │
+    │    → 设置 NEXTAUTH_COOKIE_DOMAIN │
+    │                              │
+    │ 2. OAuth 集成可用性          │
+    │    → 考虑主域名统一回调方案    │
+    │                              │
+    │ 3. SSL 证书监控              │
+    │    → 实现健康检查或手动验证   │
+    │                              │
+    │ 4. 反向代理配置              │
+    │    → 保留 Host 头和协议头     │
+    └─────────────────────────────┘
+```
+
+### 6.4 术语统一说明
+
+本文档统一使用以下术语：
+
+| 术语 | 定义 | 曾用别名 |
+|------|------|----------|
+| **自定义域名** | 企业用户自行配置的域名（如 `cal.company.com`）| 自有域名、企业域名 |
+| **组织子域名** | SaaS 平台下的三级域名（如 `acme.cal.com`）| - |
+| **主应用域名** | 平台主域名（如 `app.cal.com`）| - |
+| **单组织模式** | 整个部署只为一个组织服务 | 自托管模式 |
+| **多组织模式** | SaaS 平台，支持多个组织 | 多租户模式 |
+| **反向代理** | 在客户端和应用服务器之间转发请求的服务（如 Cloudflare、Nginx）| 代理 |
+| **代码可控** | 可以通过代码（API 调用）直接控制 | - |
+| **平台托管** | 由外部平台（如 Vercel）自动处理，代码无法直接控制 | 黑盒 |
+
+### 6.5 关键代码引用
+
+| 功能模块 | 文件路径 | 关键函数/配置 |
+|----------|----------|--------------|
+| Host 路由规则 | `apps/web/getNextjsOrgRewriteConfig.ts` | `getRegExpThatMatchesAllOrgDomains()` |
+| Next.js Rewrites | `apps/web/next.config.ts` | `rewrites()` 配置 |
+| 保留路径排除 | `apps/web/pagesAndRewritePaths.ts` | `topLevelRoutesExcludedFromOrgRewrite` |
+| Vercel 集成 | `packages/lib/domainManager/deploymentServices/vercel.ts` | `createDomain()`, `deleteDomain()` |
+| Cloudflare 集成 | `packages/lib/domainManager/deploymentServices/cloudflare.ts` | `addDnsRecord()`, `deleteDnsRecord()` |
+| OAuth 服务端 | `packages/features/oauth/services/OAuthService.ts` | `validateRedirectUri()` |
+| Cookie 配置 | `packages/lib/default-cookies.ts` | `defaultCookies()` |
+| 重定向安全 | `packages/lib/getSafeRedirectUrl.ts` | `getSafeRedirectUrl()` |
+| 组织重定向 | `apps/web/lib/handleOrgRedirect.ts` | `handleOrgRedirect()` |
+
+---
+
+**文档版本**: 2.1  
+**最后更新**: 2026-05-05  
+**基于代码版本**: Cal.diy 主分支
