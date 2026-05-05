@@ -704,19 +704,274 @@ Cal.diy ──Webhook──► Zapier ──Slack API──► Slack
 
 ---
 
-#### 3.4.5 各阶段详细分析
+#### 3.4.5 真实的错误处理机制（分模式）
 
-| 阶段 | 阶段名称 | 触发条件 | 失败恢复路径 | 关键代码位置 |
+**⚠️ 重要修正**：以下是代码实际实现的错误处理逻辑，与之前理想化的描述有显著差异。
+
+##### 核心发现
+
+| 发现 | 说明 |
+|------|------|
+| **非 2xx HTTP 响应不会触发重试** | 只是记录错误日志，任务被标记为成功 |
+| **只有网络异常才会触发重试** | 只有 `fetch()` 抛出异常（如 ECONNREFUSED、ETIMEDOUT）时才会触发重试 |
+| **sendWebhook 任务无重试配置** | `tasksConfig` 中没有配置 `sendWebhook` 的重试策略 |
+| **429 限流不会重试** | Slack 限流响应（429）不会触发任何重试 |
+
+---
+
+##### 两种发送模式对比
+
+系统有两种 Webhook 发送模式，由环境变量 `TASKER_ENABLE_WEBHOOKS` 控制：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Webhook 发送模式选择                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+TASKER_ENABLE_WEBHOOKS === "1"?
+         │
+    ┌────┴────┐
+    │ 是       │ 否
+    ▼          ▼
+┌────────┐  ┌─────────────┐
+│ 任务队列 │  │  直接发送    │
+│ 模式   │  │   模式      │
+└───┬────┘  └──────┬──────┘
+    │              │
+    ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  sendWebhook 任务          │  webhookDelivery 任务          │
+│  (旧方式)                   │  (新方式)                      │
+│  无重试配置                  │  有重试配置                     │
+│  不检查响应状态码             │  通过 processWebhooks 处理     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 模式 1：直接发送 (`TASKER_ENABLE_WEBHOOKS !== "1"`)
+
+**触发条件**：
+```typescript
+// WebhookService.ts:28
+if (process.env.TASKER_ENABLE_WEBHOOKS === "1") {
+  return await this.scheduleWebhook(trigger, payload, subscriber);  // 任务队列
+} else {
+  return await this.sendWebhookDirectly(trigger, payload, subscriber);  // 直接发送
+}
+```
+
+**真实处理逻辑**：
+
+| 失败类型 | HTTP 状态码 | 处理方式 | 是否重试 | 代码位置 |
+|---------|------------|---------|---------|---------|
+| **网络异常** | - | 记录错误日志，`Promise.allSettled` 捕获 | ❌ **无重试** | `WebhookService.ts:169` |
+| **HTTP 400** | 400 Bad Request | 记录错误日志，不抛出异常 | ❌ **无重试** | `WebhookService.ts:161` |
+| **HTTP 401** | 401 Unauthorized | 记录错误日志，不抛出异常 | ❌ **无重试** | `WebhookService.ts:161` |
+| **HTTP 404** | 404 Not Found | 记录错误日志，不抛出异常 | ❌ **无重试** | `WebhookService.ts:161` |
+| **HTTP 429** | 429 Too Many Requests | 记录错误日志，不抛出异常 | ❌ **无重试** | `WebhookService.ts:161` |
+| **HTTP 5xx** | 500/502/503/504 | 记录错误日志，不抛出异常 | ❌ **无重试** | `WebhookService.ts:161` |
+
+**关键代码分析**：
+
+```typescript
+// WebhookService.ts:145-178
+const promises = subscribers.map(async (subscriber) => {
+  try {
+    const result = await this.sendWebhook(trigger, payload, subscriber);
+
+    if (result.ok) {
+      this.log.debug(`Webhook sent successfully`, { ... });
+    } else {
+      // ⚠️ 关键：非 2xx 响应只是记录日志，不会抛出异常！
+      this.log.error(`Webhook failed`, {
+        error: result.message,
+        trigger,
+        webhookId: subscriber.id,
+        statusCode: result.status,
+      });
+    }
+  } catch (err) {
+    // ⚠️ 只有网络异常（fetch 抛出）才会进入这里
+    this.log.error("Error sending webhook", { ... });
+    throw err;  // 抛出异常给 Promise.allSettled
+  }
+});
+
+// Promise.allSettled 只是记录结果，不会重试
+const results = await Promise.allSettled(promises);
+```
+
+**结论**：直接发送模式下，**所有失败都不会触发重试**，只有隔离性保障（一个订阅者失败不影响其他）。
+
+---
+
+##### 模式 2：任务队列 (`TASKER_ENABLE_WEBHOOKS === "1"`)
+
+任务队列模式下有两种任务类型，处理方式不同：
+
+**对比表**：
+
+| 特性 | sendWebhook 任务 | webhookDelivery 任务 |
+|------|-----------------|---------------------|
+| **任务配置** | ❌ 无 `tasksConfig` | ✅ 有配置（5分钟间隔，最多3次） |
+| **响应状态检查** | ❌ 不检查 `ok` 字段 | ❌ 通过 `processWebhooks` 处理，不抛出异常 |
+| **网络异常** | ✅ 会触发重试 | ✅ 会触发重试 |
+| **HTTP 4xx** | ❌ 不重试 | ❌ 不重试 |
+| **HTTP 5xx** | ❌ 不重试 | ❌ 不重试 |
+
+---
+
+###### 类型 A：sendWebhook 任务
+
+**任务定义** (`packages/features/tasker/tasks/sendWebook.ts`):
+
+```typescript
+export async function sendWebhook(payload: string): Promise<void> {
+  try {
+    const { secretKey, triggerEvent, createdAt, webhook, data } = 
+      sendWebhookPayloadSchema.parse(JSON.parse(payload));
+    
+    // ⚠️ 关键问题：sendPayload 返回 { ok, status }，但这里没有检查！
+    await sendPayload(secretKey, triggerEvent, createdAt, webhook, data);
+    
+    // 非 2xx 响应时，sendPayload 返回 { ok: false }
+    // 但这里不检查，所以任务会被标记为成功！
+    
+  } catch (error) {
+    // ⚠️ 只有网络异常（fetch 抛出）才会进入这里
+    console.error(error);
+    throw error;  // 抛出异常才会触发重试
+  }
+}
+```
+
+**sendPayload 实现** (`packages/features/webhooks/lib/sendPayload.ts:301`):
+
+```typescript
+const _sendPayload = async (secretKey, webhook, body, contentType) => {
+  const { subscriberUrl, version } = webhook;
+  
+  const response = await fetch(subscriberUrl, {
+    method: "POST",
+    headers: { ... },
+    body,
+  });
+
+  // ⚠️ 返回 ok 和 status，但不抛出异常
+  return {
+    ok: response.ok,      // 只有 200-299 为 true
+    status: response.status,
+  };
+};
+```
+
+**重试配置** (`packages/features/tasker/tasks/index.ts`):
+
+```typescript
+export const tasksConfig = {
+  webhookDelivery: {
+    minRetryIntervalMins: IS_PRODUCTION ? 5 : 1,
+    maxAttempts: 3,
+  },
+  createCRMEvent: {
+    minRetryIntervalMins: IS_PRODUCTION ? 10 : 1,
+    maxAttempts: 10,
+  },
+  // ⚠️ 注意：sendWebhook 任务没有配置！
+};
+```
+
+**sendWebhook 任务真实处理**：
+
+| 失败类型 | 处理方式 | 是否重试 | 原因 |
+|---------|---------|---------|------|
+| **网络异常** (fetch 抛出) | 任务失败，调用 `Task.retry()` | ⚠️ **可能不重试** | 无 `tasksConfig`，使用默认值 |
+| **HTTP 4xx** | 记录错误日志，任务标记成功 | ❌ **不重试** | `sendPayload` 不抛出异常 |
+| **HTTP 5xx** | 记录错误日志，任务标记成功 | ❌ **不重试** | `sendPayload` 不抛出异常 |
+| **HTTP 429 (限流)** | 记录错误日志，任务标记成功 | ❌ **不重试** | `sendPayload` 不抛出异常 |
+
+---
+
+###### 类型 B：webhookDelivery 任务
+
+**任务定义** (`packages/features/tasker/tasks/webhookDelivery.ts`):
+
+```typescript
+export async function webhookDelivery(payload: string, taskId?: string): Promise<void> {
+  try {
+    const parsedPayload = webhookTaskPayloadSchema.parse(JSON.parse(payload));
+    const consumer = getWebhookTaskConsumer();
+    
+    // 调用 WebhookTaskConsumer.processWebhookTask
+    await consumer.processWebhookTask(parsedPayload, taskId);
+    
+  } catch (error) {
+    log.error("Failed to process webhook delivery task", { ... });
+    throw error;
+  }
+}
+```
+
+**处理流程**：
+```
+webhookDelivery → processWebhookTask → sendWebhooksToSubscribers → processWebhooks
+```
+
+**关键**：`processWebhooks` 的实现与直接发送模式相同，非 2xx 响应**不抛出异常**。
+
+**webhookDelivery 任务真实处理**：
+
+| 失败类型 | 处理方式 | 是否重试 | 配置 |
+|---------|---------|---------|------|
+| **网络异常** (fetch 抛出) | 任务失败，调用 `Task.retry()` | ✅ **最多 3 次** | 5 分钟间隔，最多 3 次 |
+| **HTTP 4xx** | 记录错误日志，任务标记成功 | ❌ **不重试** | `processWebhooks` 不抛出异常 |
+| **HTTP 5xx** | 记录错误日志，任务标记成功 | ❌ **不重试** | `processWebhooks` 不抛出异常 |
+| **HTTP 429 (限流)** | 记录错误日志，任务标记成功 | ❌ **不重试** | `processWebhooks` 不抛出异常 |
+
+---
+
+##### 任务重试逻辑核心
+
+**task-processor 只对异常重试** (`packages/features/tasker/task-processor.ts:9`):
+
+```typescript
+return taskHandler(task.payload, task.id)
+  .then(async () => {
+    // ✅ 成功：标记任务完成
+    await Task.succeed(task.id);
+  })
+  .catch(async (error) => {
+    // ⚠️ 只有抛出异常才会进入这里！
+    console.info(`Retrying task ${task.id}: ${error}`);
+    await Task.retry({
+      taskId: task.id,
+      lastError: error instanceof Error ? error.message : "Unknown error",
+      minRetryIntervalMins: taskConfig?.minRetryIntervalMins,
+    });
+  });
+```
+
+**关键理解**：
+- `taskHandler` 返回的 Promise **resolved** 时，任务被标记为成功
+- `taskHandler` 返回的 Promise **rejected** 时，才会触发重试
+- **非 2xx 响应不会导致 Promise rejected**，因为 `sendPayload` 不抛出异常
+
+---
+
+#### 3.4.6 各阶段详细分析（修正版）
+
+| 阶段 | 阶段名称 | 触发条件 | 真实恢复路径 | 关键代码位置 |
 |------|-----------|---------|-------------|-------------|
 | **阶段 0** | 配置阶段 | 用户手动操作 | 无（手动操作） | - |
-| **阶段 1** | 事件触发源 | 预约业务逻辑执行 | 无（事件是业务逻辑的一部分） | `RegularBookingService.ts` |
-| **阶段 2** | 订阅者查找 | `getSubscribers()` 被调用 | **L4 隔离性：数据库查询失败 → 记录日志，跳过该订阅者 | `WebhookService.ts:135` |
-| **阶段 3** | Payload 构建 | `PayloadBuilder.build()` | **L4 隔离性：构建失败 → 记录警告，跳过该订阅者 | `BookingPayloadBuilder.ts:63` |
+| **阶段 1** | 事件触发源 | 预约业务逻辑执行 | 无 | `RegularBookingService.ts` |
+| **阶段 2** | 订阅者查找 | `getSubscribers()` 被调用 | **L4 隔离性**：数据库查询失败 → 记录日志，跳过 | `WebhookService.ts:135` |
+| **阶段 3** | Payload 构建 | `PayloadBuilder.build()` | **L4 隔离性**：构建失败 → 记录警告，跳过 | `BookingPayloadBuilder.ts:63` |
 | **阶段 4** | 模板渲染 | `payloadTemplate !== null` | **L4 隔离性**：模板语法错误 → 使用默认格式 | `sendPayload.ts:183` |
 | **阶段 5** | 任务入队 | `TASKER_ENABLE_WEBHOOKS=1` | **L1 即时回退**：入队失败 → 回退到直接发送 | `WebhookService.ts:45` |
-| **阶段 6** | 任务处理 | TaskProcessor/Trigger.dev | **L1-L3 四层恢复**：完整的四层恢复机制 | `task-processor.ts:9` |
-| **阶段 7** | HTTP 发送 | `fetch()` 调用 | **L2-L3 重试**：网络错误 → 触发重试机制 | `sendPayload.ts:312` |
-| **阶段 8** | Slack 处理 | Slack 接收 Webhook | 无（超出 Cal.diy 控制范围 | - |
+| **阶段 6** | 任务处理 | TaskProcessor/Trigger.dev | **只有网络异常才重试**：非 2xx 不触发 | `task-processor.ts:27` |
+| **阶段 7** | HTTP 发送 | `fetch()` 调用 | **非 2xx 不重试**：只有网络异常抛出才重试 | `sendPayload.ts:301` |
+| **阶段 8** | Slack 处理 | Slack 接收 Webhook | 无（超出 Cal.diy 控制范围） | - |
 
 ---
 
