@@ -686,10 +686,10 @@ export async function roundRobinReassignment(_args: {...}): Promise<void> {
 
 **步骤 1: API v2 调用点**
 
-位置: `apps/api/v2/src/platform/bookings/2024-08-13/services/bookings.service.ts:1-12
+位置: `apps/api/v2/src/platform/bookings/2024-08-13/services/bookings.service.ts:1-12`
 
 ```typescript
-// 1. 从 platform-libraries 导入
+// 1. 从根路径导入（package.json exports 有 "." 出口，tsconfig 没有根路径映射）
 import {
   confirmBookingHandler,
   distributedTracing,
@@ -985,17 +985,17 @@ export class ProfileRepository implements IProfileRepository {
 
 | 层级 | 模式 | 证据位置 |
 |------|------|---------|
-| **API 入口** | 继承 + 依赖注入 | `BookingCancelService extends BaseBookingCancelService` |
-| **路径约束** | 显式子路径枚举 (16 条) | `tsconfig.json:24-37` 非通配符映射 |
-| **桥接层** | Facade 模式 + 子模块出口 | `packages/platform/libraries/bookings.ts` |
-| **业务层** | Service 模式 | `BookingCancelService` 类 |
-| **数据层** | Repository 模式 + 依赖注入 | `ProfileRepository` 接收 `prismaClient` |
+| **API 入口** | 继承 + 依赖注入 | `apps/api/v2/src/lib/services/booking-cancel.service.ts:11-27` |
+| **路径约束** | 显式子路径枚举 (14 条，含 pbac 无效映射) | `apps/api/v2/tsconfig.json:24-37` 非通配符映射 |
+| **桥接层** | Facade 模式 + 子模块出口 | `packages/platform/libraries/bookings.ts:6` |
+| **业务层** | Service 模式 | `packages/features/bookings/lib/handleCancelBooking.ts:526-537` |
+| **数据层** | Repository 模式 + 依赖注入 | `packages/features/profile/repositories/ProfileRepository.ts:94-99` |
 
 **关键发现**: 这条链路展示了一个**更完整**的架构模式：
 1. 不是简单的函数导出，而是 **Service + Repository 类** 的复用
 2. API v2 通过**继承**共享类，并注入 NestJS 特有的 Prisma 服务
 3. 数据层通过**依赖注入**实现框架无关性（features 只定义接口，API v2 注入具体实现）
-4. 子路径映射确保 API v2 只能访问预先声明的 16 个模块
+4. 子路径映射确保 API v2 只能访问预先声明的 14 个模块（其中 pbac 为无效映射）
 
 ---
 
