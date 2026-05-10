@@ -262,6 +262,113 @@ packages/app-store/
 | **禁止循环依赖** | 通过架构设计避免循环 |
 | **Barrel Imports** | 禁止使用 index.ts 聚合导出 |
 
+### 3.4 依赖方向的约束机制 ⭐
+
+包边界的依赖方向通过**多层配置**和**架构规则**共同约束：
+
+#### 3.4.1 TypeScript 路径映射约束 (tsconfig.json)
+
+**Web 应用 (`apps/web/tsconfig.json:2-15`)** 有完整的路径映射，可以直接访问所有包：
+
+```json
+{
+  "extends": "@calcom/tsconfig/nextjs.json",
+  "compilerOptions": {
+    "paths": {
+      "~/*": ["modules/*"],
+      "@components/*": ["components/*"],
+      "@lib/*": ["lib/*"],
+      "@server/*": ["server/*"],
+      "@prisma/client/*": ["@calcom/prisma/client/*"],
+      "@calcom/testing/*": ["../../packages/testing/src/*"],
+      "@calcom/repository/*": ["@calcom/lib/server/repository/*"],
+      "@coss/ui/*": ["../../packages/coss-ui/src/*"]
+    }
+  }
+}
+```
+
+**API v2 (`apps/api/v2/tsconfig.json:16-38`) 的路径映射被刻意限制**，只能通过 platform 包访问业务逻辑：
+
+```json
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"],
+      "@calcom/prisma/client": ["../../../packages/prisma/generated/prisma/client"],
+      "@calcom/prisma/enums": ["../../../packages/prisma/enums"],
+      "@calcom/platform-constants": ["../../../packages/platform/constants/index.ts"],
+      "@calcom/platform-types": ["../../../packages/platform/types/index.ts"],
+      "@calcom/platform-utils": ["../../../packages/platform/utils/index.ts"],
+      "@calcom/platform-enums": ["../../../packages/platform/enums/index.ts"],
+      "@calcom/platform-libraries/*": ["../../../packages/platform/libraries/*.ts"]
+      // ⚠️ 注意：没有 @calcom/features/* 和 @calcom/trpc/* 的映射！
+    }
+  }
+}
+```
+
+**关键发现**: API v2 的 tsconfig 中**没有**配置 `@calcom/features/*` 和 `@calcom/trpc/*` 的路径映射，这意味着：
+- `import { X } from "@calcom/features/..."` 会直接报错 "module not found"
+- 只能通过 `@calcom/platform-libraries` 作为桥梁间接访问
+
+#### 3.4.2 Package.json 依赖声明约束
+
+各包通过 `package.json` 的 `dependencies` 显式声明依赖，Yarn Workspaces 确保只能依赖已声明的包：
+
+**Web 应用可以直接依赖 features (`apps/web/package.json:35-48`)**：
+```json
+"dependencies": {
+  "@calcom/app-store": "workspace:*",
+  "@calcom/features": "workspace:*",    // ✅ 直接依赖
+  "@calcom/lib": "workspace:*",
+  "@calcom/prisma": "workspace:*",
+  "@calcom/trpc": "workspace:*",         // ✅ 直接依赖
+  "@calcom/ui": "workspace:*"
+}
+```
+
+**API v2 只能依赖 platform 包 (`apps/api/v2/package.json:42-49`)**：
+```json
+"dependencies": {
+  "@calcom/platform-constants": "workspace:*",
+  "@calcom/platform-enums": "workspace:*",
+  "@calcom/platform-libraries": "workspace:*",  // ⭐ 唯一的业务逻辑入口
+  "@calcom/platform-types": "workspace:*",
+  "@calcom/platform-utils": "workspace:*",
+  "@calcom/prisma": "workspace:*"
+  // ⚠️ 没有 @calcom/features 和 @calcom/trpc
+}
+```
+
+#### 3.4.3 Platform Libraries 作为受控出口
+
+`@calcom/platform-libraries` 是一个**显式受控的出口层**，只导出需要被 API v2 使用的能力：
+
+```typescript
+// packages/platform/libraries/index.ts
+export { confirmHandler as confirmBookingHandler } from "@calcom/trpc/server/routers/viewer/bookings/confirm.handler";
+export { ProfileRepository } from "@calcom/features/profile/repositories/ProfileRepository";
+export { BookingAccessService } from "@calcom/features/bookings/services/BookingAccessService";
+// ... 只导出需要的，不是全部
+```
+
+这种设计确保了：
+1. API v2 不能随意访问 features 的内部实现
+2. 所有复用点都是显式声明的，易于追踪
+3. Web 和 API v2 的业务逻辑保持一致
+
+#### 3.4.4 架构规则约束 (AGENTS.md)
+
+项目还通过 `AGENTS.md` 中的开发规范强化边界：
+
+| 约束项 | 规则内容 | 强制执行方式 |
+|--------|---------|-------------|
+| **禁止 Barrel Imports** | "Never use barrel imports from index.ts files" | 代码审查 + lint 规则 |
+| **直接导入源文件** | "Import directly from source files, not barrel files" | 示例：`@calcom/ui/components/button` |
+| **Repository 不包含业务逻辑** | "Never put business logic in repositories" | 架构设计审查 |
+| **Business Logic 在 Services** | "that belongs in Services" | Repository + Service 模式 |
+
 ---
 
 ## 4. 构建入口与 Turborepo 配置
