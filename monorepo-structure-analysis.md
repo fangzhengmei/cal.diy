@@ -288,7 +288,7 @@ packages/app-store/
 }
 ```
 
-**API v2 (`apps/api/v2/tsconfig.json:16-38`) 的路径映射被刻意限制**，只能通过 platform 包访问业务逻辑：
+**API v2 (`apps/api/v2/tsconfig.json:16-38`) 的路径映射被刻意限制，使用多条显式子路径而非通配符**：
 
 ```json
 {
@@ -301,16 +301,54 @@ packages/app-store/
       "@calcom/platform-types": ["../../../packages/platform/types/index.ts"],
       "@calcom/platform-utils": ["../../../packages/platform/utils/index.ts"],
       "@calcom/platform-enums": ["../../../packages/platform/enums/index.ts"],
-      "@calcom/platform-libraries/*": ["../../../packages/platform/libraries/*.ts"]
-      // ⚠️ 注意：没有 @calcom/features/* 和 @calcom/trpc/* 的映射！
+      // ⚠️ 以下是多条显式子路径映射，不是通配符！
+      "@calcom/platform-libraries/event-types": ["../../../packages/platform/libraries/event-types.ts"],
+      "@calcom/platform-libraries/slots": ["../../../packages/platform/libraries/slots.ts"],
+      "@calcom/platform-libraries/emails": ["../../../packages/platform/libraries/emails.ts"],
+      "@calcom/platform-libraries/schedules": ["../../../packages/platform/libraries/schedules.ts"],
+      "@calcom/platform-libraries/app-store": ["../../../packages/platform/libraries/app-store.ts"],
+      "@calcom/platform-libraries/conferencing": ["../../../packages/platform/libraries/conferencing.ts"],
+      "@calcom/platform-libraries/repositories": ["../../../packages/platform/libraries/repositories.ts"],
+      "@calcom/platform-libraries/bookings": ["../../../packages/platform/libraries/bookings.ts"],
+      "@calcom/platform-libraries/private-links": ["../../../packages/platform/libraries/private-links.ts"],
+      "@calcom/platform-libraries/organizations": ["../../../packages/platform/libraries/organizations.ts"],
+      "@calcom/platform-libraries/errors": ["../../../packages/platform/libraries/errors.ts"],
+      "@calcom/platform-libraries/calendars": ["../../../packages/platform/libraries/calendars.ts"],
+      "@calcom/platform-libraries/tasker": ["../../../packages/platform/libraries/tasker.ts"],
+      "@calcom/platform-libraries/pbac": ["../../../packages/platform/libraries/pbac.ts"]
+      // ⚠️ 关键：没有 @calcom/features/* 和 @calcom/trpc/* 的映射！
+      // ⚠️ 也没有 "@calcom/platform-libraries" 通配符映射！
     }
   }
 }
 ```
 
-**关键发现**: API v2 的 tsconfig 中**没有**配置 `@calcom/features/*` 和 `@calcom/trpc/*` 的路径映射，这意味着：
-- `import { X } from "@calcom/features/..."` 会直接报错 "module not found"
-- 只能通过 `@calcom/platform-libraries` 作为桥梁间接访问
+**关键发现** (修正后的事实描述):
+
+1. **多条显式子路径，而非通配符**: API v2 的 tsconfig 中为 `@calcom/platform-libraries` 配置了 **16 条显式的子路径映射**（如 `event-types`、`slots`、`bookings`、`repositories` 等），每条都指向具体的 `.ts` 文件，而不是使用通配符 `@calcom/platform-libraries/*`
+
+2. **与 package.json exports 一一对应**: 这些子路径映射与 `packages/platform/libraries/package.json:38-108` 中的 `exports` 字段完全对应
+
+   ```json
+   // packages/platform/libraries/package.json:38-108
+   "exports": {
+     "./event-types": { ... },
+     "./slots": { ... },
+     "./bookings": { ... },
+     "./repositories": { ... },
+     // ... 16 个子路径出口
+   }
+   ```
+
+3. **完全缺失 features 和 trpc 映射**: tsconfig 中**完全没有**配置 `@calcom/features/*` 和 `@calcom/trpc/*` 的路径映射，这意味着：
+   - `import { X } from "@calcom/features/..."` 会直接报错 "module not found"
+   - `import { X } from "@calcom/trpc/..."` 同样报错
+   - 只能通过 `@calcom/platform-libraries` 的显式子路径间接访问
+
+4. **设计意图**: 这种"显式枚举"而非"通配符"的方式，是一种更强的边界约束：
+   - 不是"允许访问 platform-libraries 下的任意内容"
+   - 而是"只允许访问这 16 个预先声明的子模块"
+   - 添加新的复用点必须同时修改 package.json exports 和 tsconfig paths
 
 #### 3.4.2 Package.json 依赖声明约束
 
@@ -559,6 +597,163 @@ export async function roundRobinReassignment(_args: {...}): Promise<void> {
 ```
 
 这样社区版也能编译通过，在运行时抛出明确的错误。
+
+### 5.7 端到端复用链路示例 ⭐
+
+让我们追踪一条从 **API v2 确认预订到共享业务实现的完整链路：
+
+#### 5.7.1 链路总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    API v2 确认预订调用链路                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. API v2 Controller/Service                                     │
+│     apps/api/v2/src/platform/bookings/.../bookings.service.ts      │
+│                           │                                          │
+│                           ▼                                          │
+│  2. 从 @calcom/platform-libraries 导入                               │
+│     import { confirmBookingHandler } from "@calcom/platform-libraries"│
+│                           │                                          │
+│                           ▼                                          │
+│  3. platform-libraries 桥接层                                    │
+│     packages/platform/libraries/index.ts:90                           │
+│     export { confirmHandler as confirmBookingHandler }                │
+│                           │                                          │
+│                           ▼                                          │
+│  4. tRPC Handler 入口                                           │
+│     packages/trpc/server/routers/viewer/bookings/confirm.handler.ts  │
+│                           │                                          │
+│                           ▼                                          │
+│  5. 调用共享业务逻辑                                               │
+│     packages/features/bookings/lib/handleConfirmation.ts             │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.7.2 详细步骤
+
+**步骤 1: API v2 调用点**
+
+位置: `apps/api/v2/src/platform/bookings/2024-08-13/services/bookings.service.ts:1-12
+
+```typescript
+// 1. 从 platform-libraries 导入
+import {
+  confirmBookingHandler,
+  distributedTracing,
+  getAllUserBookings,
+  getCalendarLinks,
+  getTranslation,
+  handleCancelBooking,
+  handleMarkNoShow,
+  roundRobinManualReassignment,
+  roundRobinReassignment,
+} from "@calcom/platform-libraries";
+```
+
+**步骤 2: API v2 实际调用**
+
+位置: `apps/api/v2/src/platform/bookings/2024-08-13/services/bookings.service.ts:1135-1152`
+
+```typescript
+await confirmBookingHandler({
+  ctx: {
+    user: {
+      ...requestUser,
+      destinationCalendar: userCalendars?.destinationCalendar ?? null,
+    },
+    traceContext: distributedTracing.createTrace("api_v2_confirm_booking"),
+  },
+  input: {
+    bookingId: booking.id,
+    confirmed: true,
+    recurringEventId: booking.recurringEventId ?? undefined,
+    emailsEnabled,
+    platformClientParams,
+    actionSource: "API_V2",
+    actor: makeUserActor(requestUser.uuid),
+  },
+});
+```
+
+**步骤 3: Platform Libraries 桥接导出**
+
+位置: `packages/platform/libraries/index.ts:90`
+
+```typescript
+// 桥接层将 tRPC handler 重命名导出
+export { confirmHandler as confirmBookingHandler } from "@calcom/trpc/server/routers/viewer/bookings/confirm.handler";
+```
+
+**步骤 4: tRPC Handler 入口**
+
+位置: `packages/trpc/server/routers/viewer/bookings/confirm.handler.ts:51-60`
+
+```typescript
+// 这是 Web 和 API v2 共用的 handler
+export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
+  const log = logger.getSubLogger({ prefix: ["confirmHandler"] });
+  const {
+    bookingId,
+    recurringEventId,
+    reason: rejectionReason,
+    confirmed,
+    emailsEnabled,
+    platformClientParams,
+  } = input;
+  // ... 业务逻辑
+```
+
+**步骤 5: Handler 调用共享业务**
+
+位置: `packages/trpc/server/routers/viewer/bookings/confirm.handler.ts:9, 364`
+
+```typescript
+// 从 features 导入核心业务逻辑
+import { handleConfirmation } from "@calcom/features/bookings/lib/handleConfirmation";
+
+// 在 handler 内部调用
+await handleConfirmation({
+  user: { ...user, credentials: allCredentials },
+  evt,
+  recurringEventId,
+  // ...
+});
+```
+
+**步骤 6: 最终业务实现**
+
+位置: `packages/features/bookings/lib/handleConfirmation.ts:23-60`
+
+```typescript
+// 这是真正的业务逻辑实现
+export async function handleConfirmation(args: {
+  user: EventManagerUser & { username: string | null };
+  evt: CalendarEvent;
+  recurringEventId?: string;
+  prisma: PrismaClient;
+  bookingId: number;
+  // ...
+}) {
+  // 发送邮件、触发 webhook、更新状态等核心业务
+}
+```
+
+#### 5.7.3 链路总结
+
+| 层级 | 文件位置 | 职责 |
+|------|---------|------|
+| **API 层** | `apps/api/v2/.../bookings.service.ts` | 接收 HTTP 请求，调用共享 handler |
+| **桥接层** | `packages/platform/libraries/index.ts` | 重命名导出，解决 tsconfig 路径限制 |
+| **tRPC 层** | `packages/trpc/.../confirm.handler.ts` | 处理 tRPC 特定逻辑（上下文、鉴权） |
+| **业务层** | `packages/features/.../handleConfirmation.ts` | 纯业务逻辑，与框架无关 |
+
+**关键设计**: tRPC handler 是一个"薄包装器"，真正的业务逻辑在 `@calcom/features` 中，这样：
+1. Web 通过 tRPC 直接调用 handler
+2. API v2 通过 platform-libraries 桥接调用同一个 handler
+3. 两者最终执行相同的 `handleConfirmation` 业务逻辑
 
 ---
 
