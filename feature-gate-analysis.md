@@ -1,157 +1,440 @@
-# Cal.diy 企业功能 Feature Flag & License Gate 真实链路分析
+# Cal.diy 企业功能可见性控制机制分析
+
+## 目录
+
+- [1. 核心结论](#1-核心结论)
+- [2. 已实现的企业功能：hideBranding（品牌去除）](#2-已实现的企业功能hidebranding品牌去除)
+  - [2.1 功能概述](#21-功能概述)
+  - [2.2 hasPaidPlan 判定链（设置页面侧）](#22-haspaidplan-判定链设置页面侧)
+  - [2.3 hideBranding 判定链（预订页面侧）](#23-hidebranding-判定链预订页面侧)
+  - [2.4 完整链路图](#24-完整链路图)
+- [3. 未实现的 License Gate 机制](#3-未实现的-license-gate-机制)
+  - [3.1 session.hasValidLicense 路径](#31-sessionhasvalidlicense-路径)
+  - [3.2 setup 页面 hasValidLicense 路径](#32-setup-页面-hasvalidlicense-路径)
+  - [3.3 两条路径为何都不生效](#33-两条路径为何都不生效)
+- [4. 关键代码索引](#4-关键代码索引)
+
+---
 
 ## 1. 核心结论
 
-Cal.diy 当前**没有任何实际生效的企业功能 gate 控制**。所有与许可证相关的校验都是**占位实现**，即使代码中存在 `hasValidLicense` 变量，也不会实际影响任何功能的可见性。
-
-| 机制 | 代码中存在 | 实际生效 | 说明 |
-|------|----------|---------|------|
-| **License Gate** | ✅ 有相关代码 | ❌ 全部是占位 | 所有检查方法直接返回 true 或硬编码 |
-| **Feature Flag** | ✅ 完整实现 | ⚠️ 控制的是新功能发布 | 如 `email-verification`、`onboarding-v3`，不是企业付费功能 |
-| **hasPaidPlan** | ✅ 存在 | ❌ 未找到实际定义 | 仅在 props 声明中出现 |
-
----
-
-## 2. 真正的企业功能入口列表
-
-经过代码扫描，以下是与"企业功能"相关的真实页面/组件入口：
-
-### 2.1 部署设置页面
-
-| 入口 | 路径 | 关联 gate |
-|------|------|----------|
-| 页面 URL | `/auth/setup?step=1` | `hasValidLicense`（硬编码为 false） |
-| Server Page | `apps/web/app/(use-page-wrapper)/auth/setup/page.tsx` | 调用 `getServerSideProps` |
-| getServerSideProps | `apps/web/server/lib/setup/getServerSideProps.tsx` | 第 39 行硬编码 |
-
-### 2.2 品牌去除功能（Hide Branding）
-
-| 入口 | 路径 | 关联 gate |
-|------|------|----------|
-| 设置页面 | `/settings/my-account/appearance` | `hasPaidPlan` |
-| 组件 | `apps/web/modules/settings/my-account/appearance-view.tsx` | 第 393 行判断 `!hasPaidPlan` |
-| Booking 页面 | 所有预订页面 | `hideBranding` prop |
-| Booker 组件 | `apps/web/modules/bookings/components/Booker.tsx` | 接收但未使用 `hasValidLicense` |
-
-### 2.3 其他潜在企业功能点
-
-| 入口 | 路径 | 说明 |
+| 机制 | 状态 | 说明 |
 |------|------|------|
-| UpgradeTip | `apps/web/modules/shell/UpgradeTip.tsx` | 开源版本直接渲染 children，无 gate |
-| BookerPlatformWrapper | `packages/platform/atoms/booker/BookerPlatformWrapper.tsx` | 硬编码 `hasValidLicense={true}` |
-| API v2 License Check | `apps/api/v2/src/modules/deployments/deployments.service.ts` | 注释说明"完全开源，无需许可证" |
+| **hasPaidPlan → hideBranding** | ✅ **已实现** | 控制"去除品牌标识"功能的可见性和启用 |
+| **session.hasValidLicense** | ⚠️ **占位** | 永远为 `true`，传递但未被实际使用 |
+| **setup.hasValidLicense** | ⚠️ **占位** | 硬编码为 `false`，不影响任何 UI |
+| **UpgradeTip** | ⚠️ **占位** | 直接渲染 children，无付费墙 |
+| **requiresLicense** | ⚠️ **占位** | 两个分支渲染相同内容 |
+
+**重要区分**：
+- Cal.diy 有**实际生效**的企业功能 gate（`hasPaidPlan` 控制的 `hideBranding`）
+- 但 License Gate 系统（`hasValidLicense` 相关）**全部是占位实现**，未实际控制任何功能
 
 ---
 
-## 3. 企业功能 Gate 判定链详解
+## 2. 已实现的企业功能：hideBranding（品牌去除）
 
-### 3.1 链路 A: `/auth/setup` 页面（部署设置）
+### 2.1 功能概述
 
-#### 完整请求链路
+**hideBranding** 是 Cal.diy 中唯一完全实现的企业功能 gate：
+
+| 功能点 | 说明 |
+|--------|------|
+| **功能内容** | 去除预订页面底部/角落的 "Powered by Cal.com" 等品牌标识 |
+| **控制层级** | 团队/组织/用户三级 |
+| **gate 机制** | `hasPaidPlan` 控制开关可用性，`hideBranding` 设置控制实际展示 |
+
+### 2.2 hasPaidPlan 判定链（设置页面侧）
+
+#### 入口页面
+- **URL**: `/settings/my-account/appearance`
+- **文件**: `apps/web/app/(use-page-wrapper)/settings/(settings-layout)/my-account/appearance/page.tsx`
+
+#### 完整判定链路
 
 ```
-用户请求: GET /auth/setup?step=1
+用户请求: GET /settings/my-account/appearance
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 1. Server Page (App Router)                                      │
-│    apps/web/app/(use-page-wrapper)/auth/setup/page.tsx           │
-│                                                                  │
-│    const props = await getData(buildLegacyCtx(...))              │
-│    → 调用 withAppDirSsr → getServerSideProps                     │
+│ 1. 检查登录状态                                                    │
+│    const session = await getServerSession({ req: buildLegacyRequest(...) });│
+│    const userId = session?.user?.id;                             │
+│    if (!userId) redirect(redirectUrl);                            │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 2. getServerSideProps                                            │
-│    apps/web/server/lib/setup/getServerSideProps.tsx              │
+│ 2. 并行获取两个关键数据                                            │
 │                                                                  │
-│    // 第 38-41 行: ⚠️ 硬编码，不做任何实际校验                    │
-│    // Check if there's already a valid license using            │
-│    // LicenseKeyService                                          │
-│    const hasValidLicense = false;    // ← 硬编码为 false         │
-│    const isFreeLicense = true;       // ← 硬编码为 true          │
-│                                                                  │
-│    // 第 43-49 行: 返回给页面                                      │
-│    return {                                                       │
-│      props: {                                                     │
-│        isFreeLicense,     // = true                              │
-│        userCount,                                                  │
-│        hasValidLicense,   // = false                              │
-│      },                                                           │
-│    };                                                             │
+│    2a. 创建 meRouter 调用器                                       │
+│    const [meCaller, hasTeamPlan] = await Promise.all([           │
+│      createRouterCaller(meRouter),                                │
+│      getCachedHasTeamPlan(userId),  // ← 检查是否属于团队        │
+│    ]);                                                           │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 3. Setup 页面组件                                                 │
-│    接收 hasValidLicense=false 和 isFreeLicense=true              │
+│ 3. getCachedHasTeamPlan 的详细逻辑                                │
+│    位置: apps/web/app/cache/membership.ts:11-22                  │
 │                                                                  │
-│    ⚠️ 实际影响: 这些值被传递但可能不影响任何 UI                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### 关键代码
-
-**文件**: `apps/web/server/lib/setup/getServerSideProps.tsx:38-49`
-
-```typescript
-// Check if there's already a valid license using LicenseKeyService
-const hasValidLicense = false;   // ⚠️ 硬编码为 false
-
-const isFreeLicense = true;      // ⚠️ 硬编码为 true
-
-return {
-  props: {
-    isFreeLicense,     // = true
-    userCount,
-    hasValidLicense,   // = false
-  },
-};
-```
-
-#### 分析结论
-
-这条路径的 `hasValidLicense` **永远是 false**，原因是：
-- 代码注释说明 "Check if there's already a valid license using LicenseKeyService"
-- 但实际代码直接硬编码为 `false`，没有调用任何 LicenseKeyService
-- `isFreeLicense` 也被硬编码为 `true`
-
-### 3.2 链路 B: `session.hasValidLicense`（Session 注入路径）
-
-#### 完整请求链路
-
-```
-用户登录 / 请求验证 Session
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. Session 初始化                                                 │
-│    packages/features/auth/lib/getServerSession.ts                │
+│    export const getCachedHasTeamPlan = unstable_cache(           │
+│      async (userId: number) => {                                  │
+│        const hasTeamPlan = await MembershipRepository            │
+│          .hasAnyAcceptedMembershipByUserId(userId);              │
+│        // → 查询数据库是否有已接受的团队成员关系                   │
+│        return { hasTeamPlan: !!hasTeamPlan };                     │
+│      },                                                          │
+│      ["getCachedHasTeamPlan"],                                   │
+│      { revalidate: NEXTJS_CACHE_TTL, tags: [...] }               │
+│    );                                                           │
 │                                                                  │
-│    const session = await getServerSession({ req, res, authOptions })│
-│    or                                                             │
-│    const token = await getToken({ req })                         │
+│    结果: { hasTeamPlan: true/false }                              │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 2. LicenseKeySingleton 检查                                       │
-│    packages/features/auth/lib/getServerSession.ts:11-15          │
+│ 4. 获取用户数据                                                   │
+│    const user = await meCaller.get();                            │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. 计算 hasPaidPlan（关键判定点）                                  │
+│    位置: apps/web/app/(use-page-wrapper)/settings/(settings-layout)/my-account/appearance/page.tsx:46│
+│                                                                  │
+│    // 检查用户 metadata 中是否有 isPremium 标记                    │
+│    const isCurrentUsernamePremium =                              │
+│      user && hasKeyInMetadata(user, "isPremium")                 │
+│        ? !!user.metadata.isPremium                               │
+│        : false;                                                  │
+│                                                                  │
+│    // 最终计算:                                                   │
+│    const hasPaidPlan = IS_SELF_HOSTED                            │
+│      ? true                     // 自托管: 永远 true            │
+│      : hasTeamPlan?.hasTeamPlan   // 非自托管: 检查是否有团队     │
+│        || isCurrentUsernamePremium; // 或是否是 Premium 用户      │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. 传递给 AppearancePage 组件                                    │
+│    return <AppearancePage user={user} hasPaidPlan={hasPaidPlan} />;│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### hasPaidPlan 判定逻辑总结
+
+```
+hasPaidPlan = ?
+
+    IS_SELF_HOSTED = true?
+        │
+        ├─ 是 → hasPaidPlan = true (自托管版本认为所有用户都是付费用户)
+        │
+        └─ 否 → hasPaidPlan = hasTeamPlan || isCurrentUsernamePremium
+                    │
+                    ├─ hasTeamPlan: 用户是否属于任意团队
+                    │              MembershipRepository.hasAnyAcceptedMembershipByUserId()
+                    │              数据库查询: Membership where userId = ? AND accepted = true
+                    │
+                    └─ isCurrentUsernamePremium: 用户 metadata.isPremium = true
+```
+
+#### 在 AppearancePage 中的使用
+
+**文件**: `apps/web/modules/settings/my-account/appearance-view.tsx:390-402`
+
+```tsx
+<SettingsToggle
+  toggleSwitchAtTheEnd={true}
+  title={t("disable_cal_branding", { appName: APP_NAME })}
+  
+  // ⚠️ 关键 1: 如果 !hasPaidPlan，开关被禁用（灰色不可点击）
+  disabled={!hasPaidPlan || mutation?.isPending}
+  
+  description={t("removes_cal_branding", { appName: APP_NAME })}
+  
+  // ⚠️ 关键 2: 开关显示值
+  // 如果有 paid plan，显示用户的 hideBranding 设置
+  // 如果没有 paid plan，永远显示 false
+  checked={hasPaidPlan ? hideBrandingValue : false}
+  
+  onCheckedChange={(checked) => {
+    setHideBrandingValue(checked);
+    mutation.mutate({ hideBranding: checked });
+  }}
+  switchContainerClassName="mt-6"
+/>
+```
+
+**行为**：
+
+| 场景 | 开关状态 | 用户能做什么 |
+|------|---------|-------------|
+| `hasPaidPlan = true` | 显示用户的 `hideBrandingValue` | 可点击切换，保存到数据库 |
+| `hasPaidPlan = false` | 永远显示 false | 灰色禁用，无法切换 |
+
+### 2.3 hideBranding 判定链（预订页面侧）
+
+#### 预订页面入口
+- **URL**: `/[user]/[type]`（如 `/john/30min-meeting`）
+- **类型**: Pages Router (getServerSideProps)
+
+#### 完整判定链路
+
+```
+用户请求: GET /[user]/[type]
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. getServerSideProps 服务端执行                                  │
+│    位置: apps/web/server/lib/[user]/[type]/getServerSideProps.tsx│
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. 计算 isBrandingHidden（关键判定点）                             │
+│    位置: 第 271-274 行                                           │
+│                                                                  │
+│    isBrandingHidden: shouldHideBrandingForUserEvent({            │
+│      eventTypeId: eventData.id,                                  │
+│      owner: user,                                                │
+│    }),                                                          │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. shouldHideBrandingForUserEvent 详细逻辑                       │
+│    位置: packages/features/profile/lib/hideBranding.ts:172-184  │
+│                                                                  │
+│    export function shouldHideBrandingForUserEvent({              │
+│      eventTypeId,                                                │
+│      owner,                                                      │
+│    }: {                                                          │
+│      eventTypeId: number;                                        │
+│      owner: UserWithProfile;                                     │
+│    }) {                                                          │
+│      return shouldHideBrandingForEventUsingProfile({             │
+│        owner,                                                    │
+│        team: null,                                               │
+│        eventTypeId,                                              │
+│      });                                                         │
+│    }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. shouldHideBrandingForEventUsingProfile 核心判定               │
+│    位置: packages/features/profile/lib/hideBranding.ts:88-113  │
+│                                                                  │
+│    export function shouldHideBrandingForEventUsingProfile({      │
+│      eventTypeId,                                                │
+│      owner,                                                      │
+│      team,                                                       │
+│    }) {                                                          │
+│      let hideBranding;                                           │
+│      if (team) {                                                 │
+│        // 团队事件: 检查团队 + 组织设置                            │
+│        hideBranding = resolveHideBranding({                      │
+│          entityHideBranding: team.hideBranding ?? null,          │
+│          organizationHideBranding: team.parent?.hideBranding ?? null,│
+│        });                                                       │
+│      } else if (owner) {                                         │
+│        // 用户事件: 检查用户 + 组织设置                            │
+│        hideBranding = resolveHideBranding({                      │
+│          entityHideBranding: owner.hideBranding ?? null,         │
+│          organizationHideBranding:                               │
+│            owner.profile?.organization?.hideBranding ?? null,    │
+│        });                                                       │
+│      } else {                                                    │
+│        log.error(`No owner or team found for event: ${eventTypeId}`);│
+│        return false;                                             │
+│      }                                                           │
+│      return hideBranding;                                        │
+│    }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. resolveHideBranding 优先级规则                                 │
+│    位置: packages/features/profile/lib/hideBranding.ts:33-43   │
+│                                                                  │
+│    function resolveHideBranding(options: {                       │
+│      entityHideBranding: boolean | null;                         │
+│      organizationHideBranding: boolean | null;                   │
+│    }): boolean {                                                 │
+│      // ⚠️ 关键: 组织级别优先级高于实体级别                        │
+│      // 如果组织设置了 hideBranding=true，忽略实体自己的设置        │
+│      if (options.organizationHideBranding) {                     │
+│        return true;                                              │
+│      }                                                           │
+│      // 否则使用实体自己的设置，null 回退到 false                  │
+│      return options.entityHideBranding ?? false;                 │
+│    }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. 传递给前端页面组件                                             │
+│    返回 props: { isBrandingHidden, ... }                         │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. 前端页面组件接收                                               │
+│    位置: apps/web/modules/users/views/users-type-public-view.tsx:27│
+│                                                                  │
+│    function Type({ ..., isBrandingHidden, ... }: PageProps) {    │
+│      return (                                                    │
+│        <Booker                                                   │
+│          ...                                                     │
+│          hideBranding={isBrandingHidden}  // ⚠️ 传递给 Booker   │
+│          ...                                                     │
+│        />                                                        │
+│      );                                                          │
+│    }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 预订页 hideBranding 判定总结
+
+**优先级（从高到低）**：
+
+```
+组织 (Organization) hideBranding = true?
+    │
+    ├─ 是 → 隐藏品牌（最高优先级，覆盖实体设置）
+    │
+    └─ 否 → 实体 (User/Team) hideBranding = true?
+             │
+             ├─ 是 → 隐藏品牌
+             │
+             └─ 否 / null → 显示品牌（默认）
+```
+
+**注意**：预订页的 `shouldHideBrandingForEvent` **不检查 `hasPaidPlan`**
+
+这意味着：
+- **设置页面**：`hasPaidPlan` 控制"是否允许启用"
+- **预订页面**：只看数据库中 `hideBranding` 字段的值，不检查是否付费
+
+**潜在问题**：如果直接修改数据库绕过设置页面的限制，可能可以启用这个功能而不付费。
+
+### 2.4 完整链路图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          已实现的企业功能: hideBranding                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                         ┌─────────────────────────────────┐
+                         │         设置页面侧              │
+                         │  /settings/my-account/appearance │
+                         └──────────────┬──────────────────┘
+                                        │
+                                        ▼
+                    ┌───────────────────────────────────────┐
+                    │ 1. 计算 hasPaidPlan                   │
+                    │                                      │
+                    │    自托管? ────┐                      │
+                    │       │        │                      │
+                    │      是        否                     │
+                    │       │        │                      │
+                    │       ▼        ▼                      │
+                    │     true    hasTeamPlan ||            │
+                    │               isCurrentUsernamePremium│
+                    │         ↓                            │
+                    │    hasPaidPlan = ?                   │
+                    └──────────────┬───────────────────────┘
+                                   │
+                                   ▼
+                    ┌───────────────────────────────────────┐
+                    │ 2. 控制 hideBranding 开关              │
+                    │                                      │
+                    │    hasPaidPlan = true?               │
+                    │       │                               │
+                    │       ├─ 是 → 开关可用，保存到数据库   │
+                    │       └─ 否 → 开关禁用，无法切换       │
+                    └──────────────┬───────────────────────┘
+                                   │
+                                   │ 保存到:
+                                   │  - User.hideBranding
+                                   │  - Team.hideBranding
+                                   │  - Organization.hideBranding
+                                   ▼
+
+                         ┌─────────────────────────────────┐
+                         │         预订页面侧              │
+                         │        /[user]/[type]          │
+                         └──────────────┬──────────────────┘
+                                        │
+                                        ▼
+                    ┌───────────────────────────────────────┐
+                    │ 1. 计算 isBrandingHidden              │
+                    │                                      │
+                    │    shouldHideBrandingForEvent()      │
+                    │         ↓                            │
+                    │    resolveHideBranding()             │
+                    │         ↓                            │
+                    │    组织 hideBranding = true?         │
+                    │       │                               │
+                    │       ├─ 是 → isBrandingHidden = true│
+                    │       └─ 否 → 实体 hideBranding = ?   │
+                    │                │                      │
+                    │                ├─ true → 隐藏         │
+                    │                └─ false/null → 显示   │
+                    └──────────────┬───────────────────────┘
+                                   │
+                                   ▼
+                    ┌───────────────────────────────────────┐
+                    │ 2. 传递给 Booker 组件                 │
+                    │    hideBranding={isBrandingHidden}   │
+                    │                                      │
+                    │    Booker 根据此值决定是否渲染品牌标识 │
+                    └───────────────────────────────────────┘
+```
+
+---
+
+## 3. 未实现的 License Gate 机制
+
+### 3.1 session.hasValidLicense 路径
+
+#### 入口
+- **注入点**: Session 创建时
+- **文件**: `packages/features/auth/lib/getServerSession.ts`
+
+#### 完整链路
+
+```
+Session 初始化
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 创建 LicenseKeySingleton                                      │
+│    位置: packages/features/auth/lib/getServerSession.ts:11-15   │
 │                                                                  │
 │    class LicenseKeySingleton {                                   │
 │      static async getInstance(..._args: unknown[]) {             │
-│        return new LicenseKeySingleton();                         │
+│        return new LicenseKeySingleton();  // ⚠️ 忽略所有参数   │
 │      }                                                           │
+│                                                                  │
 │      async checkLicense() {                                      │
-│        return true;  // ⚠️ 直接返回 true，无任何校验              │
+│        return true;  // ⚠️ 直接返回 true，无任何校验            │
 │      }                                                           │
+│                                                                  │
 │      async validateLicenseKey() {                                │
-│        return true;  // ⚠️ 直接返回 true，无任何校验              │
+│        return true;  // ⚠️ 直接返回 true，无任何校验            │
 │      }                                                           │
 │    }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. 调用 checkLicense()                                           │
 │                                                                  │
-│    // 实际调用:                                                  │
 │    const deploymentRepo = new DeploymentRepository(prisma);      │
 │    const licenseKeyService = await LicenseKeySingleton.getInstance(│
 │      deploymentRepo                                              │
@@ -162,542 +445,216 @@ return {
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 3. Session 注入 hasValidLicense                                   │
+│ 3. 注入到 Session                                                │
 │                                                                  │
 │    const session: Session = {                                    │
 │      hasValidLicense,  // = true (永远)                          │
 │      // ... 其他字段                                              │
 │    };                                                             │
-│                                                                  │
-│    定义位置: packages/types/next-auth.d.ts:12                    │
-│    interface Session {                                           │
-│      hasValidLicense: boolean;  // 类型定义存在                   │
-│      ...                                                         │
-│    }                                                             │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 4. 前端使用 session.hasValidLicense                               │
+│ 4. 前端传递值                                                    │
+│    位置: apps/web/modules/bookings/components/BookerWebWrapper.tsx:223│
 │                                                                  │
-│    发现位置:                                                     │
-│    a) BookerWebWrapper                                           │
-│       apps/web/modules/bookings/components/BookerWebWrapper.tsx:223│
-│       hasValidLicense={session?.hasValidLicense ?? false}        │
-│       → 传递给 Booker 组件，但 Booker 不使用                      │
-│                                                                  │
-│    b) AdminPasswordBanner.test.tsx (仅测试)                      │
-│       测试代码中 mock hasValidLicense: true                      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### 关键代码
-
-**文件**: `packages/features/auth/lib/getServerSession.ts:11-15`
-
-```typescript
-// ⚠️ 这是完整的占位实现 - 所有方法直接返回 true
-class LicenseKeySingleton {
-  static async getInstance(..._args: unknown[]) {
-    return new LicenseKeySingleton();
-  }
-  async checkLicense() {
-    return true;  // ⚠️ 无任何校验
-  }
-  async validateLicenseKey() {
-    return true;  // ⚠️ 无任何校验
-  }
-}
-```
-
-**文件**: `packages/features/auth/lib/getServerSession.ts`（实际调用处）
-
-```typescript
-const deploymentRepo = new DeploymentRepository(prisma);
-const licenseKeyService = await LicenseKeySingleton.getInstance(deploymentRepo);
-const hasValidLicense = await licenseKeyService.checkLicense();
-// → hasValidLicense 永远 = true
-
-// 注入到 session
-const session: Session = {
-  hasValidLicense,  // = true
-  // ...
-};
-```
-
-#### 分析结论
-
-这条路径的 `session.hasValidLicense` **永远是 true**，原因是：
-- `LicenseKeySingleton.checkLicense()` 是占位实现，直接返回 `true`
-- 没有读取数据库的 `Deployment.licenseKey`
-- 没有进行任何签名验证
-- 即使 Session 类型定义了 `hasValidLicense: boolean`，实际值永远是 `true`
-
-### 3.3 链路 C: Booker 组件的 hasValidLicense
-
-#### 完整链路
-
-```
-用户访问预订页面
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. BookerWebWrapper 获取 Session                                 │
-│    apps/web/modules/bookings/components/BookerWebWrapper.tsx:91  │
-│                                                                  │
-│    const { data: session } = useSession();                      │
+│    hasValidLicense={session?.hasValidLicense ?? false}           │
+│    // → 值永远为 true（因为 session.hasValidLicense 永远是 true）│
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 2. 传递 hasValidLicense 给 Booker                                 │
-│    apps/web/modules/bookings/components/BookerWebWrapper.tsx:223 │
-│                                                                  │
-│    hasValidLicense={session?.hasValidLicense ?? false}          │
-│    // → 值为 true (因为 session.hasValidLicense 永远是 true)      │
-└─────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 3. Booker 组件接收 hasValidLicense                                │
-│    apps/web/modules/bookings/components/Booker.tsx:80            │
+│ 5. Booker 组件接收                                                │
+│    位置: apps/web/modules/bookings/components/Booker.tsx:80      │
 │                                                                  │
 │    const BookerComponent = ({                                    │
 │      ...                                                         │
-│      hasValidLicense,  // ⚠️ 接收了这个 prop                      │
+│      hasValidLicense,  // ⚠️ 接收了这个 prop                     │
 │      ...                                                         │
 │    })                                                            │
 │                                                                  │
-│    但是: 整个 Booker.tsx 文件 (600+ 行) 中                        │
-│         没有任何地方使用 hasValidLicense 做条件判断               │
+│    ⚠️ 关键问题: 整个 Booker.tsx 文件中                            │
+│       没有任何地方使用 hasValidLicense 做条件判断                 │
+│       没有 if (hasValidLicense)                                  │
+│       没有 hasValidLicense ? 三元表达式                          │
+│       完全未被使用！                                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-#### 关键代码
+#### 结论
 
-**文件**: `apps/web/modules/bookings/components/BookerWebWrapper.tsx:223`
+`session.hasValidLicense` **不生效**的原因：
+1. **值层面**: `LicenseKeySingleton.checkLicense()` 永远返回 `true`
+2. **使用层面**: Booker 组件接收了这个 prop 但**从未使用**
 
-```typescript
-hasValidLicense={session?.hasValidLicense ?? false}
-// session?.hasValidLicense 永远是 true
-// 所以这里实际传递的是 true
-```
+### 3.2 setup 页面 hasValidLicense 路径
 
-**文件**: `apps/web/modules/bookings/components/Booker.tsx:80`
-
-```typescript
-hasValidLicense,  // ← 在解构中接收
-```
-
-**验证**: 搜索整个 Booker.tsx 文件
-```
-搜索结果: 仅在解构声明中出现一次
-没有任何 if (hasValidLicense)、hasValidLicense ? 等判断
-```
-
-#### 分析结论
-
-Booker 组件的 `hasValidLicense` **prop 被传递但从未被使用**，原因是：
-- prop 存在于 `BookerProps` 类型定义中
-- `BookerWebWrapper` 确实传递了这个 prop
-- 但 Booker 组件内部**没有任何条件判断使用这个值**
-- 即使值为 true 或 false，对渲染结果**毫无影响**
-
-### 3.4 链路 D: BookerPlatformWrapper（硬编码 true）
+#### 入口
+- **URL**: `/auth/setup?step=1`
+- **文件**: `apps/web/server/lib/setup/getServerSideProps.tsx`
 
 #### 完整链路
 
 ```
-Platform API 调用 BookerPlatformWrapper
+用户请求: GET /auth/setup?step=1
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ BookerPlatformWrapper 直接硬编码                                  │
-│ packages/platform/atoms/booker/BookerPlatformWrapper.tsx:569     │
-│                                                                  │
-│ hasValidLicense={true}  // ⚠️ 直接写死为 true                     │
-└─────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 传递给内部 Booker 组件                                            │
-│                                                                  │
-│ 同样的问题: Booker 不使用这个值                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### 关键代码
-
-**文件**: `packages/platform/atoms/booker/BookerPlatformWrapper.tsx:569`
-
-```typescript
-hasValidLicense={true}  // ⚠️ 硬编码，不依赖任何实际许可证状态
-```
-
-#### 分析结论
-
-Platform 场景下 `hasValidLicense` 被**直接硬编码为 true**，原因是：
-- Platform 可能被认为是"企业用户"场景
-- 但没有任何实际的许可证校验逻辑
-- 即使 Platform 用户没有许可证，这里也会传递 true
-
-### 3.5 链路 E: `requiresLicense`（PageWrapper 属性）
-
-#### 完整链路
-
-```
-页面被 (use-page-wrapper) 路由组包裹
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. 路由组 Layout 调用 PageWrapper                                 │
-│    apps/web/app/(use-page-wrapper)/layout.tsx                    │
-│                                                                  │
-│    <PageWrapper requiresLicense={false} nonce={nonce}>           │
-│      {children}                                                  │
-│    </PageWrapper>                                                │
-│    // ⚠️ 所有页面当前设置为 requiresLicense=false                 │
+│ 1. getServerSideProps 执行                                       │
+│    位置: apps/web/server/lib/setup/getServerSideProps.tsx:38-49 │
 └─────────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ 2. PageWrapper 组件（App Router）                                 │
-│    apps/web/components/PageWrapperAppDir.tsx:29-33               │
+│ 2. 硬编码 hasValidLicense                                        │
 │                                                                  │
-│    <AppProviders {...providerProps}>                             │
-│      {props.requiresLicense ? (                                  │
-│        <>{props.children}</>    // ⚠️ 渲染 children              │
-│      ) : (                                                       │
-│        <>{props.children}</>    // ⚠️ 同样渲染 children!          │
-│      )}                                                          │
-│    </AppProviders>                                               │
+│    // Check if there's already a valid license using            │
+│    // LicenseKeyService                                          │
+│    const hasValidLicense = false;   // ⚠️ 硬编码为 false        │
+│    const isFreeLicense = true;      // ⚠️ 硬编码为 true         │
 │                                                                  │
-│    ⚠️ 关键问题: 两个分支渲染完全相同的内容                         │
+│    ⚠️ 关键问题: 注释说使用 LicenseKeyService                     │
+│       但实际代码直接硬编码，没有调用任何服务                      │
 └─────────────────────────────────────────────────────────────────┘
-```
-
-#### 关键代码
-
-**文件**: `apps/web/app/(use-page-wrapper)/layout.tsx`
-
-```typescript
-<PageWrapper requiresLicense={false} nonce={nonce}>
-  {children}
-</PageWrapper>
-```
-
-**文件**: `apps/web/components/PageWrapperAppDir.tsx:29-33`
-
-```typescript
-<AppProviders {...providerProps}>
-  {props.requiresLicense ? (
-    <>{props.children}</>
-  ) : (
-    <>{props.children}</>  // ⚠️ 与上面完全相同
-  )}
-</AppProviders>
-```
-
-#### 分析结论
-
-`requiresLicense` 属性**完全无效**，原因是：
-1. **值层面**：所有路由组当前设置为 `requiresLicense={false}`
-2. **逻辑层面**：即使设置为 `true`，PageWrapper 的两个分支渲染相同内容
-3. 没有任何许可证检查逻辑，没有重定向，没有条件渲染
-
-### 3.6 链路 F: `UpgradeTip` 组件
-
-#### 完整链路
-
-```
-页面渲染 UpgradeTip 组件
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ UpgradeTip 组件实现                                               │
-│ apps/web/modules/shell/UpgradeTip.tsx:1-17                       │
+│ 3. 返回给页面                                                    │
 │                                                                  │
-│ export function UpgradeTip({                                     │
-│   children,                                                      │
-│ }: {                                                             │
-│   plan?: "team" | "enterprise";  // 有 plan 属性定义              │
-│   ...                                                            │
-│ }) {                                                             │
-│   // ⚠️ 注释说明: 开源版本没有付费墙                              │
-│   // In the open-source distribution there is no paywall –       │
-│   // always render children.                                     │
-│   return <>{children}</>;                                        │
-│ }                                                                │
+│    return {                                                      │
+│      props: {                                                    │
+│        isFreeLicense,     // = true                              │
+│        userCount,                                                 │
+│        hasValidLicense,   // = false                             │
+│      },                                                          │
+│    };                                                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-#### 关键代码
+#### 结论
 
-**文件**: `apps/web/modules/shell/UpgradeTip.tsx:1-17`
+`setup` 页面的 `hasValidLicense` **不生效**的原因：
+1. **值层面**: 直接硬编码为 `false`
+2. **使用层面**: Setup 页面可能也没有根据这个值做任何条件判断
 
-```typescript
-export function UpgradeTip({
-  children,
-}: {
-  title?: string;
-  description?: string;
-  background?: string;
-  features?: Array<...>;
-  buttons?: JSX.Element;
-  children: ReactNode;
-  isParentLoading?: ReactNode;
-  plan?: "team" | "enterprise";  // 类型定义存在
-}) {
-  // In the open-source distribution there is no paywall – always render children.
-  return <>{children}</>;
-}
-```
+### 3.3 两条路径为何都不生效
 
-#### 分析结论
+#### 问题一：LicenseKeyService 是占位实现
 
-`UpgradeTip` **完全没有 gate 逻辑**，原因是：
-- 代码注释明确说明 "In the open-source distribution there is no paywall"
-- 即使传入 `plan="enterprise"`，也直接渲染 children
-- 没有显示任何升级提示或付费墙
+所有与许可证相关的类/方法都是占位：
 
----
+| 方法 | 位置 | 实际行为 |
+|------|------|---------|
+| `LicenseKeySingleton.checkLicense()` | `getServerSession.ts` | `return true` |
+| `LicenseKeySingleton.validateLicenseKey()` | `getServerSession.ts` | `return true` |
+| `LicenseKeyService.validateLicenseKey()` | `validateLicense.handler.ts` | `return true` |
+| `DeploymentsService.checkLicense()` | `API v2` | `return true` |
 
-## 4. 为什么两条 `hasValidLicense` 路径都不生效
+**没有任何方法**：
+- 读取数据库 `Deployment.licenseKey`
+- 验证许可证签名
+- 检查过期时间
+- 连接外部许可证服务
 
-### 4.1 路径对比
+#### 问题二：没有实际的条件判断
 
-| 维度 | 路径 A: session.hasValidLicense | 路径 B: setup 页面 hasValidLicense |
-|------|-------------------------------|-----------------------------------|
-| **定义位置** | `getServerSession()` 注入 Session | `getServerSideProps()` 返回 props |
-| **值** | 永远 = `true` | 永远 = `false` |
-| **原因** | `LicenseKeySingleton.checkLicense()` → `return true` | 直接硬编码 `const hasValidLicense = false` |
-| **使用场景** | 传给 Booker 组件 | 传给 Setup 页面 |
-| **实际影响** | Booker 不使用这个值 | 未知（Setup 页面可能不使用）|
-| **最终效果** | ❌ 不生效 | ❌ 不生效 |
+即使 `hasValidLicense` 值被传递：
 
-### 4.2 共同问题：占位实现
+| 使用位置 | 实际行为 |
+|---------|---------|
+| Booker 组件 | 接收 prop 但从未使用 |
+| PageWrapper.requiresLicense | 两个分支渲染相同内容 |
+| UpgradeTip 组件 | 直接渲染 children |
 
-两条路径都**不生效**的根本原因是：
+**没有任何地方**：
+- `if (!hasValidLicense) return <UpgradeBanner />`
+- `if (!hasValidLicense) redirect to /upgrade`
+- 禁用某些按钮或隐藏某些菜单
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 问题 1: LicenseKeyService 是占位                                  │
-│                                                                  │
-│ 所有相关的许可证验证类:                                          │
-│ - LicenseKeySingleton.checkLicense() → return true              │
-│ - LicenseKeySingleton.validateLicenseKey() → return true        │
-│ - LicenseKeyService.validateLicenseKey() → return true          │
-│ - DeploymentsService.checkLicense() → return true               │
-│                                                                  │
-│ 没有任何一个方法:                                                 │
-│ - 读取数据库 Deployment.licenseKey                              │
-│ - 验证许可证签名                                                 │
-│ - 检查过期时间                                                   │
-│ - 连接外部许可证服务                                              │
-└─────────────────────────────────────────────────────────────────┘
+#### 问题三：代码注释明确说明是开源版本
 
-┌─────────────────────────────────────────────────────────────────┐
-│ 问题 2: 没有实际的条件判断                                        │
-│                                                                  │
-│ 即使 hasValidLicense 值传递给组件:                               │
-│ - Booker 组件: 接收了但不使用                                     │
-│ - PageWrapper: 两个分支渲染相同内容                               │
-│ - UpgradeTip: 直接渲染 children                                 │
-│                                                                  │
-│ 没有任何地方做:                                                  │
-│ - if (!hasValidLicense) return <UpgradeBanner />                │
-│ - if (!hasValidLicense) redirect to /upgrade                    │
-│ - 禁用某些按钮或隐藏某些菜单                                      │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│ 问题 3: 代码注释说明是开源版本                                    │
-│                                                                  │
-│ 多处代码注释明确说明:                                             │
-│                                                                  │
-│ 1. UpgradeTip.tsx:15-16                                          │
-│    "In the open-source distribution there is no paywall –        │
-│     always render children."                                     │
-│                                                                  │
-│ 2. API v2 deployments.service.ts:14-16                           │
-│    "Cal.diy is fully open source — no license key is required."  │
-│                                                                  │
-│ 这意味着: 开源版本故意不实现许可证功能                            │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 4.3 代码中的明确证据
-
-**证据 1**: API v2 服务注释
-
-**文件**: `apps/api/v2/src/modules/deployments/deployments.service.ts:14-17`
-
-```typescript
-@Injectable()
-export class DeploymentsService {
-  // Cal.diy is fully open source — no license key is required.
-  async checkLicense() {
-    return true;
-  }
-}
-```
-
-**证据 2**: UpgradeTip 组件注释
-
-**文件**: `apps/web/modules/shell/UpgradeTip.tsx:15-16`
-
+**证据 1**: UpgradeTip 组件
 ```typescript
 // In the open-source distribution there is no paywall – always render children.
 return <>{children}</>;
 ```
 
----
-
-## 5. Feature Flag 系统的实际使用场景
-
-虽然 Feature Flag 系统完整实现了，但它控制的是**新功能发布**，不是**企业付费功能**。
-
-### 5.1 当前使用的 Feature Flags
-
-| Feature Flag | 使用位置 | 控制内容 |
-|-------------|---------|---------|
-| `email-verification` | `VerifyEmailBanner.tsx` | 邮箱验证横幅显示 |
-| `email-verification` | `useRedirectToOnboardingIfNeeded.tsx` | 是否需要邮箱验证 |
-| `email-verification` | `verify-email-view.tsx` | 验证页面逻辑 |
-| `onboarding-v3` | `useRedirectToOnboardingIfNeeded.tsx` | 新版 onboarding 路径 |
-| `onboarding-v3` | `CompanyEmailOrganizationBanner.tsx` | 组织创建路径 |
-| `onboarding-v3` | `verify-email-view.tsx` | PostHog 事件标记 |
-
-### 5.2 典型使用模式
-
-**示例 1: VerifyEmailBanner**
-
-**文件**: `apps/web/modules/users/components/VerifyEmailBanner.tsx:13-17`
-
+**证据 2**: API v2 DeploymentsService
 ```typescript
-function VerifyEmailBanner({ data }: VerifyEmailBannerProps) {
-  const flags = useFlagMap();
-  
-  // ⚠️ 这是 Feature Flag，不是 License Gate
-  // 控制的是新功能是否发布，不是企业功能付费
-  if (!data || !flags["email-verification"]) return null;
-
-  return <TopBanner ... />;
+// Cal.diy is fully open source — no license key is required.
+async checkLicense() {
+  return true;
 }
 ```
 
-**示例 2: 路由选择**
+---
 
-**文件**: `apps/web/modules/settings/my-account/components/CompanyEmailOrganizationBanner.tsx:19-24`
+## 4. 关键代码索引
 
-```typescript
-const flags = useFlagMap();
+### 4.1 已实现的企业功能（hideBranding 链路）
 
-const handleLearnMore = () => {
-  const redirectPath = flags["onboarding-v3"]
-    ? "/onboarding/organization/details?migrate=true"  // 新版路径
-    : "/settings/organizations/new";                    // 旧版路径
-};
-```
+| 文件路径 | 说明 | 关键代码 |
+|---------|------|---------|
+| `apps/web/app/(use-page-wrapper)/settings/(settings-layout)/my-account/appearance/page.tsx:46` | hasPaidPlan 计算 | `const hasPaidPlan = IS_SELF_HOSTED ? true : hasTeamPlan?.hasTeamPlan \|\| isCurrentUsernamePremium` |
+| `apps/web/app/cache/membership.ts:13-15` | hasTeamPlan 查询 | `MembershipRepository.hasAnyAcceptedMembershipByUserId(userId)` |
+| `apps/web/modules/settings/my-account/appearance-view.tsx:393` | 开关禁用条件 | `disabled={!hasPaidPlan \|\| mutation?.isPending}` |
+| `apps/web/modules/settings/my-account/appearance-view.tsx:395` | 开关显示值 | `checked={hasPaidPlan ? hideBrandingValue : false}` |
+| `packages/features/profile/lib/hideBranding.ts:33-43` | resolveHideBranding | 组织优先级高于实体 |
+| `packages/features/profile/lib/hideBranding.ts:88-113` | shouldHideBrandingForEventUsingProfile | 预订页判定逻辑 |
+| `apps/web/server/lib/[user]/[type]/getServerSideProps.tsx:271-274` | 预订页 isBrandingHidden | `shouldHideBrandingForUserEvent({...})` |
+| `apps/web/modules/users/views/users-type-public-view.tsx:37` | 传递给 Booker | `hideBranding={isBrandingHidden}` |
 
-### 5.3 企业功能 vs 新功能发布
+### 4.2 未实现的 License Gate（占位）
 
-| 维度 | License Gate (企业功能) | Feature Flag (新功能发布) |
-|------|------------------------|--------------------------|
-| **目的** | 控制付费功能可见性 | 渐进式发布新功能 |
-| **粒度** | 部署级别 | 全局/团队/用户级别 |
-| **触发条件** | 购买许可证 | 功能开发完成 + 测试通过 |
-| **当前状态** | ❌ 全部占位 | ✅ 实际使用中 |
-| **当前控制的内容** | 无 | 邮箱验证、新版 onboarding 等 |
+| 文件路径 | 说明 | 状态 |
+|---------|------|------|
+| `packages/features/auth/lib/getServerSession.ts:11-15` | `LicenseKeySingleton` 占位实现 | ⚠️ 永远返回 true |
+| `apps/web/modules/bookings/components/BookerWebWrapper.tsx:223` | 传递 hasValidLicense | ⚠️ 传递但 Booker 不使用 |
+| `apps/web/server/lib/setup/getServerSideProps.tsx:38-49` | setup 页面硬编码 | ⚠️ 永远为 false |
+| `apps/web/components/PageWrapperAppDir.tsx:29-33` | requiresLicense 渲染逻辑 | ⚠️ 两个分支相同 |
+| `apps/web/modules/shell/UpgradeTip.tsx:1-17` | UpgradeTip 组件 | ⚠️ 直接渲染 children |
+| `apps/api/v2/src/modules/deployments/deployments.service.ts:14-17` | API v2 checkLicense | ⚠️ 注释说明无需许可证 |
 
 ---
 
-## 6. 关键文件索引（按真实功能关联度排序）
+## 5. 最终总结
 
-### 6.1 企业功能相关（全是占位）
+### 实际生效的企业功能 Gate
 
-| 优先级 | 文件路径 | 说明 | 状态 |
-|--------|---------|------|------|
-| 🔴 1 | `packages/features/auth/lib/getServerSession.ts:11-15` | `LicenseKeySingleton` - Session 中注入 hasValidLicense | ⚠️ 占位 |
-| 🔴 2 | `apps/web/server/lib/setup/getServerSideProps.tsx:38-49` | Setup 页面 hasValidLicense 硬编码 | ⚠️ 占位 |
-| 🔴 3 | `apps/web/components/PageWrapperAppDir.tsx:29-33` | `requiresLicense` 两个分支相同 | ⚠️ 占位 |
-| 🔴 4 | `apps/web/modules/shell/UpgradeTip.tsx:1-17` | `UpgradeTip` 直接渲染 children | ⚠️ 占位 |
-| 🔴 5 | `packages/platform/atoms/booker/BookerPlatformWrapper.tsx:569` | 硬编码 `hasValidLicense={true}` | ⚠️ 占位 |
-| 🔴 6 | `apps/api/v2/src/modules/deployments/deployments.service.ts:14-17` | API v2 注释说明"无需许可证" | ⚠️ 占位 |
-| 🟡 7 | `apps/web/modules/bookings/components/BookerWebWrapper.tsx:223` | 传递 hasValidLicense 给 Booker | ⚠️ 传递但不使用 |
-| 🟡 8 | `apps/web/modules/bookings/components/Booker.tsx:80` | 接收 hasValidLicense prop | ⚠️ 接收但不使用 |
-| 🟡 9 | `packages/types/next-auth.d.ts:12` | Session.hasValidLicense 类型定义 | ⚠️ 仅类型 |
-
-### 6.2 Feature Flag 系统（实际使用）
-
-| 优先级 | 文件路径 | 说明 | 状态 |
-|--------|---------|------|------|
-| 🟢 1 | `packages/features/flags/features.repository.ts` | 核心 Repository 实现（含递归继承） | ✅ 实现 |
-| 🟢 2 | `apps/web/modules/users/components/VerifyEmailBanner.tsx` | `email-verification` 控制横幅显示 | ✅ 使用 |
-| 🟢 3 | `apps/web/modules/auth/hooks/useRedirectToOnboardingIfNeeded.tsx` | 邮箱验证 + onboarding-v3 路径 | ✅ 使用 |
-| 🟢 4 | `packages/features/flags/config.ts` | Feature Flag 类型定义 | ✅ 实现 |
-| 🟢 5 | `apps/web/lib/app-providers-app-dir.tsx:83-90` | FeatureProvider 注入 Context | ✅ 实现 |
-| 🟢 6 | `apps/web/modules/feature-flags/hooks/useFlags.ts` | 前端 Hook 获取全局 flags | ✅ 实现 |
-
----
-
-## 7. 总结
-
-### 7.1 当前状态
+Cal.diy 有**一个**实际生效的企业功能控制机制：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Cal.diy 当前企业功能控制状态                                      │
-│                                                                  │
-│ ┌─────────────────────────────────────────────────────────────┐ │
-│ │ License Gate 系统                                            │ │
-│ │                                                              │ │
-│ │ session.hasValidLicense: 永远 = true (占位实现)              │ │
-│ │ setup hasValidLicense: 永远 = false (硬编码)                 │ │
-│ │ requiresLicense: 两个分支渲染相同内容 (无效)                  │ │
-│ │ UpgradeTip: 直接渲染 children (无 gate)                      │ │
-│ │                                                              │ │
-│ │ 结果: ❌ 没有任何实际的许可证 gate 控制                        │ │
-│ └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│ ┌─────────────────────────────────────────────────────────────┐ │
-│ │ Feature Flag 系统                                            │ │
-│ │                                                              │ │
-│ │ email-verification: 控制邮箱验证相关 UI                      │ │
-│ │ onboarding-v3: 控制新版 onboarding 路径                      │ │
-│ │ ... 其他: 新功能渐进式发布                                    │ │
-│ │                                                              │ │
-│ │ 结果: ✅ 完全实现，但控制的是新功能发布，不是企业付费功能       │ │
-│ └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│ 最终结论: Cal.diy 开源版本没有任何企业功能 gate 控制              │
-│ 代码中的注释明确说明: "no paywall", "no license key required"    │
-└─────────────────────────────────────────────────────────────────┘
+hasPaidPlan 判定链（已实现）
+├─ 自托管: 永远为 true
+└─ 非自托管:
+   ├─ hasTeamPlan: 用户是否属于任意团队
+   └─ isCurrentUsernamePremium: 用户 metadata.isPremium
+
+结果:
+├─ hasPaidPlan = true → hideBranding 开关可用
+└─ hasPaidPlan = false → hideBranding 开关禁用
 ```
 
-### 7.2 为什么不生效的根本原因
+### 未生效的 License Gate
 
-1. **架构层面**：所有许可证验证类都是占位实现，没有实际逻辑
-2. **使用层面**：即使传递了 `hasValidLicense`，组件也不使用它做条件判断
-3. **业务层面**：代码注释明确说明开源版本没有付费墙
+所有 `hasValidLicense` 相关的机制**都不生效**：
 
-### 7.3 如果要启用 License Gate 需要做什么
+```
+session.hasValidLicense 路径（不生效）
+├─ LicenseKeySingleton.checkLicense() → 永远返回 true
+└─ Booker 组件接收但未使用
 
-如果未来需要真正实现 License Gate 控制，需要：
+setup.hasValidLicense 路径（不生效）
+└─ 直接硬编码为 false，不影响任何 UI
+```
 
-1. **替换占位实现**：
-   - 实现真正的 `LicenseKeyService.validateLicenseKey()`
-   - 读取 `Deployment.licenseKey` 并验证签名
-   - 检查许可证过期时间和功能范围
+### 根本原因
 
-2. **添加实际的条件判断**：
-   - 在 `PageWrapper` 中根据 `requiresLicense` 做不同渲染
-   - 在 `Booker` 中根据 `hasValidLicense` 控制企业功能
-   - 在 `UpgradeTip` 中显示升级提示而不是直接渲染 children
+代码注释明确说明 Cal.diy 是开源版本：
+> "In the open-source distribution there is no paywall"
+> "Cal.diy is fully open source — no license key is required"
 
-3. **统一两条路径**：
-   - `session.hasValidLicense` 和 `setup` 页面的 `hasValidLicense` 应该使用相同的校验逻辑
-   - 目前一个永远 true，一个永远 false，逻辑不一致
+因此，所有 License Gate 相关的代码都是从上游 Cal.com 继承的骨架代码，在 Cal.diy 中被有意地简化或绕过。
 
 ---
 
