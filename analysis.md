@@ -864,7 +864,7 @@ const Status = {
 export type Status = (typeof Status)[keyof typeof Status];
 ```
 
-**使用**: `packages/api/v2/src/platform/bookings/2024-04-15/outputs/get-bookings.output.ts:222-224`
+**使用**: `apps/api/v2/src/platform/bookings/2024-04-15/outputs/get-bookings.output.ts:222-224`
 
 ```typescript
 @IsEnum(Status)
