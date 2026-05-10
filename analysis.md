@@ -600,6 +600,526 @@ tRPC 路由 (packages/trpc/server/routers/viewer/bookings/get.handler.ts:13)
 API v2 (packages/platform/types/bookings/2024-08-13/outputs/booking.output.ts) [字符串字面量]
 ```
 
+## 6A. BookingStatus 演进链路：从数据库到消费端的完整映射
+
+### 6A.1 演进阶段概览
+
+| 阶段 | 时间戳 | 事件 | 数据库值 | Schema 定义 |
+|-----|--------|------|---------|------------|
+| 1 | 2021-09-04 | 初始创建枚举 | `'cancelled', 'accepted', 'rejected', 'pending'` (小写) | 未知（后续添加 @map） |
+| 2 | 2022-06-04 | 数据迁移（布尔字段 → 枚举） | 不变 | 不变 |
+| 3 | - | 添加 @map 映射 | 不变（小写） | `CANCELLED @map("cancelled")` |
+| 4 | 2023-12-13 | 新增 AWAITING_HOST | 新增 `'awaiting_host'` | `AWAITING_HOST @map("awaiting_host")` |
+
+---
+
+### 6A.2 阶段 1：初始创建枚举（2021-09-04）
+
+**迁移文件**: `packages/prisma/migrations/20210904162403_add_booking_status_enum/migration.sql`
+
+```sql
+-- CreateEnum
+CREATE TYPE "BookingStatus" AS ENUM ('cancelled', 'accepted', 'rejected', 'pending');
+
+-- AlterTable
+ALTER TABLE "Booking" ADD COLUMN     "status" "BookingStatus" NOT NULL DEFAULT E'accepted';
+```
+
+**关键特征**:
+- 数据库枚举值为**小写字符串**
+- 4 个状态值：`'cancelled'`, `'accepted'`, `'rejected'`, `'pending'`
+- 默认值为 `'accepted'`
+
+---
+
+### 6A.3 阶段 2：数据迁移（2022-06-04）
+
+**迁移文件**: `packages/prisma/migrations/20220604144700_fixes_booking_status/migration.sql`
+
+```sql
+-- Set BookingStatus.PENDING
+UPDATE "Booking" SET "status" = 'pending' WHERE "confirmed" = false AND "rejected" = false AND "rescheduled" IS NOT true;
+
+-- Set BookingStatus.REJECTED
+UPDATE "Booking" SET "status" = 'rejected' WHERE "confirmed" = false AND "rejected" = true AND "rescheduled" IS NOT true;
+
+-- Set BookingStatus.CANCELLED
+UPDATE "Booking" SET "status" = 'cancelled' WHERE "confirmed" = false AND "rejected" = false AND "rescheduled" IS true;
+
+-- Set BookingStatus.ACCEPTED
+UPDATE "Booking" SET "status" = 'accepted' WHERE "confirmed" = true AND "rejected" = false AND "rescheduled" IS NOT true;
+```
+
+**迁移逻辑**:
+| 旧字段条件 | 新 status 值 |
+|-----------|-------------|
+| `confirmed=false AND rejected=false AND rescheduled<>true` | `'pending'` |
+| `confirmed=false AND rejected=true AND rescheduled<>true` | `'rejected'` |
+| `confirmed=false AND rejected=false AND rescheduled=true` | `'cancelled'` |
+| `confirmed=true AND rejected=false AND rescheduled<>true` | `'accepted'` |
+
+---
+
+### 6A.4 阶段 3：Schema @map 映射（大小写转换）
+
+**当前 Schema 定义**: `packages/prisma/schema.prisma:843-849`
+
+```prisma
+enum BookingStatus {
+  CANCELLED     @map("cancelled")
+  ACCEPTED      @map("accepted")
+  REJECTED      @map("rejected")
+  PENDING       @map("pending")
+  AWAITING_HOST @map("awaiting_host")
+}
+```
+
+**@map 指令的作用**:
+- **TypeScript 代码中**: 使用大写枚举成员名 `BookingStatus.CANCELLED`
+- **数据库中**: 存储小写值 `'cancelled'`
+- **Prisma 自动处理转换**: 开发者无需手动转换
+
+---
+
+### 6A.5 阶段 4：新增 AWAITING_HOST（2023-12-13）
+
+**迁移文件**: `packages/prisma/migrations/20231213153230_add_instant_meeting/migration.sql`
+
+```sql
+-- AlterEnum
+ALTER TYPE "BookingStatus" ADD VALUE 'awaiting_host';
+
+-- AlterEnum
+ALTER TYPE "WebhookTriggerEvents" ADD VALUE 'INSTANT_MEETING';
+
+-- AlterTable
+ALTER TABLE "EventType" ADD COLUMN     "isInstantEvent" BOOLEAN NOT NULL DEFAULT false;
+
+-- CreateTable
+CREATE TABLE "InstantMeetingToken" ( ... );
+```
+
+**关键信息**:
+- PostgreSQL 枚举新增值为 `'awaiting_host'`（小写）
+- 与即时会议（Instant Meeting）功能关联
+- Schema 中对应: `AWAITING_HOST @map("awaiting_host")`
+
+---
+
+### 6A.6 类型生成影响分析
+
+#### 枚举生成器输出
+
+**生成器配置**: `packages/prisma/schema.prisma:52-55`
+
+```prisma
+generator enums {
+  provider = "prisma-enum-generator"
+  output   = "./enums"
+}
+```
+
+**生成器实现**: `packages/prisma/enum-generator.ts:1-37`
+
+```typescript
+generatorHandler({
+  onManifest() {
+    return {
+      defaultOutput: "./enums/index.ts",
+      prettyName: "Prisma Enum Generator",
+    };
+  },
+  async onGenerate(options) {
+    const enums = options.dmmf.datamodel.enums;
+    const output = enums.map((e) => {
+      let enumString = `export const ${e.name} = {\n`;
+      e.values.forEach(({ name: value }) => {
+        enumString += `  ${value}: "${value}",\n`;  // 使用 schema 中的成员名（大写）
+      });
+      enumString += `} as const;\n\n`;
+      enumString += `export type ${e.name} = (typeof ${e.name})[keyof typeof ${e.name}];\n`;
+      return enumString;
+    });
+    // ... 写入文件
+  },
+});
+```
+
+**生成的类型（概念）**:
+```typescript
+export const BookingStatus = {
+  CANCELLED: "CANCELLED",      // 大写字符串值
+  ACCEPTED: "ACCEPTED",
+  REJECTED: "REJECTED",
+  PENDING: "PENDING",
+  AWAITING_HOST: "AWAITING_HOST",
+} as const;
+
+export type BookingStatus = (typeof BookingStatus)[keyof typeof BookingStatus];
+// 即: "CANCELLED" | "ACCEPTED" | "REJECTED" | "PENDING" | "AWAITING_HOST"
+```
+
+**注意**: 
+- 生成的 TypeScript 枚举使用**大写**字符串值
+- 但数据库中存储的是**小写**值
+- Prisma Client 在读写时自动通过 `@map` 进行转换
+
+---
+
+### 6A.7 消费端映射规则
+
+#### 规则 1：Prisma ORM 自动转换（内部使用）
+
+**场景**: 使用 Prisma Client 进行数据库操作
+
+**代码**: `packages/features/bookings/lib/handleNewBooking/createBooking.ts:6-7`
+
+```typescript
+import { BookingStatus } from "@calcom/prisma/enums";
+
+// 使用大写枚举
+const status = BookingStatus.ACCEPTED;  // "ACCEPTED"
+
+// Prisma 自动转换为数据库小写 'accepted'
+await prisma.booking.update({
+  where: { id },
+  data: { status: BookingStatus.ACCEPTED }
+});
+```
+
+**转换机制**: Prisma Client 根据 `@map` 自动转换
+
+---
+
+#### 规则 2：Kysely 原始 SQL 查询需手动转换
+
+**场景**: 使用 Kysely 进行复杂查询
+
+**文件**: `packages/trpc/server/routers/viewer/bookings/get.handler.ts:483-500`
+
+```typescript
+eb
+  .cast<BookingStatus>(
+    eb
+      .case()
+      .when("Booking.status", "=", "cancelled")      // 数据库小写
+      .then(BookingStatus.CANCELLED)                  // 代码大写
+      .when("Booking.status", "=", "accepted")       // 数据库小写
+      .then(BookingStatus.ACCEPTED)                   // 代码大写
+      .when("Booking.status", "=", "rejected")       // 数据库小写
+      .then(BookingStatus.REJECTED)                   // 代码大写
+      .when("Booking.status", "=", "pending")        // 数据库小写
+      .then(BookingStatus.PENDING)                    // 代码大写
+      .when("Booking.status", "=", "awaiting_host")  // 数据库小写
+      .then(BookingStatus.AWAITING_HOST)              // 代码大写
+      .else(BookingStatus.PENDING)
+      .end(),
+    "varchar"
+  )
+  .as("status"),
+```
+
+**映射表**:
+| 数据库值（Kysely 条件） | TypeScript 枚举值 |
+|----------------------|-----------------|
+| `"cancelled"` | `BookingStatus.CANCELLED` |
+| `"accepted"` | `BookingStatus.ACCEPTED` |
+| `"rejected"` | `BookingStatus.REJECTED` |
+| `"pending"` | `BookingStatus.PENDING` |
+| `"awaiting_host"` | `BookingStatus.AWAITING_HOST` |
+
+**关键点**: Kysely 是原始 SQL 工具，**不了解 Prisma 的 @map 映射**，必须手动转换
+
+---
+
+#### 规则 3：业务逻辑中使用大写枚举
+
+**文件**: `packages/trpc/server/routers/viewer/bookings/reportBooking.handler.ts:69-73`
+
+```typescript
+import { BookingStatus } from "@calcom/prisma/enums";
+
+const isUpcoming =
+  (booking.status === BookingStatus.ACCEPTED ||      // 大写
+    booking.status === BookingStatus.PENDING ||       // 大写
+    booking.status === BookingStatus.AWAITING_HOST) && // 大写
+    new Date(booking.startTime) > new Date();
+```
+
+---
+
+#### 规则 4：API v2 2024-04-15：大写字符串（与 Prisma 枚举一致）
+
+**文件**: `apps/api/v2/src/platform/bookings/2024-04-15/outputs/get-bookings.output.ts:19-27`
+
+```typescript
+const Status = {
+  CANCELLED: "CANCELLED",      // 大写
+  REJECTED: "REJECTED",        // 大写
+  ACCEPTED: "ACCEPTED",        // 大写
+  PENDING: "PENDING",          // 大写
+  AWAITING_HOST: "AWAITING_HOST",  // 大写 ✅ 包含
+} as const;
+
+export type Status = (typeof Status)[keyof typeof Status];
+```
+
+**使用**: `packages/api/v2/src/platform/bookings/2024-04-15/outputs/get-bookings.output.ts:222-224`
+
+```typescript
+@IsEnum(Status)
+@ApiProperty({ enum: Status, type: String })
+status!: Status;  // "CANCELLED" | "REJECTED" | "ACCEPTED" | "PENDING" | "AWAITING_HOST"
+```
+
+**一致性**: 与 Prisma 生成的枚举值完全一致（大写）
+
+---
+
+#### 规则 5：API v2 2024-08-13：小写字符串（与数据库一致）
+
+**文件**: `packages/platform/types/bookings/2024-08-13/outputs/booking.output.ts:158-161`
+
+```typescript
+@ApiProperty({ enum: ["cancelled", "accepted", "rejected", "pending"], example: "accepted" })
+@IsEnum(["cancelled", "accepted", "rejected", "pending"])
+@Expose()
+status!: "cancelled" | "accepted" | "rejected" | "pending";  // 小写
+```
+
+**关键差异**:
+1. 使用**小写**字符串（与数据库值一致）
+2. **缺少 AWAITING_HOST** ❌
+3. 枚举值硬编码在装饰器中：`["cancelled", "accepted", "rejected", "pending"]`
+
+---
+
+### 6A.8 大小写与向后兼容边界
+
+#### 三层表示系统
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    三层 BookingStatus 表示系统                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  数据库层（PostgreSQL）                                                  │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  ENUM 值（存储在磁盘）                                               │  │
+│  │  'cancelled' | 'accepted' | 'rejected' | 'pending' | 'awaiting_host'│  │
+│  │  始终小写                                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              │ Prisma @map 自动转换                      │
+│                              ▼                                          │
+│  TypeScript 代码层                                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Prisma 枚举（编译时类型）                                           │  │
+│  │  BookingStatus.CANCELLED    → "CANCELLED"（大写字符串）              │  │
+│  │  BookingStatus.ACCEPTED     → "ACCEPTED"                           │  │
+│  │  BookingStatus.REJECTED     → "REJECTED"                           │  │
+│  │  BookingStatus.PENDING      → "PENDING"                            │  │
+│  │  BookingStatus.AWAITING_HOST → "AWAITING_HOST"                      │  │
+│  │  始终大写                                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              │ API 层手动转换                            │
+│                              ▼                                          │
+│  API 契约层                                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  API v2 2024-04-15（大写）                                          │  │
+│  │  "CANCELLED" | "ACCEPTED" | "REJECTED" | "PENDING" | "AWAITING_HOST"│  │
+│  │  与 Prisma 枚举一致，包含 AWAITING_HOST ✅                           │  │
+│  │                                                                     │  │
+│  │  API v2 2024-08-13（小写）                                          │  │
+│  │  "cancelled" | "accepted" | "rejected" | "pending"                 │  │
+│  │  与数据库一致，**缺少 AWAITING_HOST** ❌                             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 向后兼容边界分析
+
+| 维度 | 2024-04-15 | 2024-08-13 | 兼容性说明 |
+|-----|-----------|-----------|-----------|
+| **大小写** | 大写字符串 | 小写字符串 | **不兼容**：客户端需要调整大小写 |
+| **AWAITING_HOST** | ✅ 支持 | ❌ 不支持 | **不兼容**：即时会议状态丢失 |
+| **枚举值来源** | 常量对象 `Status` | 硬编码数组 | 硬编码难以同步 |
+| **与 Prisma 同步** | ✅ 一致 | ❌ 不一致 | 需要额外转换层 |
+
+**问题 1：大小写变更**
+
+```typescript
+// API v2 2024-04-15 响应
+{
+  "status": "ACCEPTED"  // 大写
+}
+
+// API v2 2024-08-13 响应
+{
+  "status": "accepted"  // 小写
+}
+```
+
+**影响**: 客户端比较逻辑 `status === "ACCEPTED"` 在升级后会失败
+
+---
+
+**问题 2：AWAITING_HOST 缺失**
+
+```typescript
+// 数据库状态
+const dbStatus = 'awaiting_host';  // 实际存在
+
+// API v2 2024-04-15 能正确返回
+"status": "AWAITING_HOST"
+
+// API v2 2024-08-13 验证失败
+@IsEnum(["cancelled", "accepted", "rejected", "pending"])  // 无 awaiting_host
+// 可能导致：
+// - 序列化时过滤掉该字段
+// - 验证错误
+// - 前端无法识别即时会议状态
+```
+
+---
+
+**问题 3：Kysely 映射维护负担**
+
+**文件**: `packages/trpc/server/routers/viewer/bookings/get.handler.ts:486-496`
+
+```typescript
+.when("Booking.status", "=", "cancelled")
+.then(BookingStatus.CANCELLED)
+.when("Booking.status", "=", "accepted")
+.then(BookingStatus.ACCEPTED)
+.when("Booking.status", "=", "rejected")
+.then(BookingStatus.REJECTED)
+.when("Booking.status", "=", "pending")
+.then(BookingStatus.PENDING)
+.when("Booking.status", "=", "awaiting_host")  // 必须手动添加
+.then(BookingStatus.AWAITING_HOST)             // 必须手动添加
+```
+
+**风险**:
+- 每次新增枚举值都需要更新所有 Kysely 查询
+- 遗漏会导致 `.else(BookingStatus.PENDING)` 将新状态错误映射为 PENDING
+
+---
+
+### 6A.9 完整演进时间线
+
+```
+2021-09-04
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  创建 BookingStatus 枚举                                    │
+│  数据库值: 'cancelled', 'accepted', 'rejected', 'pending'  │
+│  4 个状态，全小写                                            │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ 2022-06-04
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  数据迁移: confirmed/rejected/rescheduled → status          │
+│  数据库值不变                                                │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ (时间未知)
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  添加 @map 映射                                              │
+│  Schema: CANCELLED @map("cancelled")                        │
+│  Prisma 自动处理大小写转换                                    │
+│  TypeScript: BookingStatus.CANCELLED ("CANCELLED")          │
+│  数据库: 'cancelled'                                        │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ 2023-12-13
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  新增 AWAITING_HOST                                          │
+│  数据库: ALTER TYPE ADD VALUE 'awaiting_host'               │
+│  Schema: AWAITING_HOST @map("awaiting_host")                │
+│  TypeScript: BookingStatus.AWAITING_HOST                    │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ 2024-04-15
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  API v2 2024-04-15 发布                                      │
+│  状态枚举: 大写，包含 AWAITING_HOST                          │
+│  "CANCELLED" | "ACCEPTED" | "REJECTED" | "PENDING" |        │
+│  "AWAITING_HOST"                                            │
+└─────────────────────────────────────────────────────────────┘
+    │
+    │ 2024-08-13
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  API v2 2024-08-13 发布                                      │
+│  状态枚举: 小写，**缺少 AWAITING_HOST**                      │
+│  "cancelled" | "accepted" | "rejected" | "pending"          │
+│  ⚠️ 与数据库一致，但与内部枚举不一致                           │
+│  ⚠️ 即时会议状态无法通过 API 返回                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 6A.10 各层映射汇总表
+
+| 层级 | 表示方式 | 值列表 | 可核对文件 |
+|-----|---------|-------|-----------|
+| **数据库** | PostgreSQL 枚举（小写） | `'cancelled'`, `'accepted'`, `'rejected'`, `'pending'`, `'awaiting_host'` | `packages/prisma/migrations/20210904162403_add_booking_status_enum/migration.sql`<br>`packages/prisma/migrations/20231213153230_add_instant_meeting/migration.sql` |
+| **Schema 定义** | Prisma 成员名（大写） | `CANCELLED`, `ACCEPTED`, `REJECTED`, `PENDING`, `AWAITING_HOST` | `packages/prisma/schema.prisma:843-849` |
+| **@map 映射** | 数据库值（小写） | `@map("cancelled")`, `@map("accepted")`, `@map("rejected")`, `@map("pending")`, `@map("awaiting_host")` | `packages/prisma/schema.prisma:843-849` |
+| **Prisma Client** | 自动转换 | 读写时自动处理大小写 | N/A（动态生成） |
+| **Kysely 查询** | 手动 CASE 转换 | 数据库小写 → 枚举大写 | `packages/trpc/server/routers/viewer/bookings/get.handler.ts:483-500` |
+| **业务逻辑** | Prisma 枚举（大写字符串） | `BookingStatus.CANCELLED` → `"CANCELLED"` | `packages/trpc/server/routers/viewer/bookings/reportBooking.handler.ts:70-73` |
+| **API v2 2024-04-15** | 自定义常量（大写） | `"CANCELLED"`, `"ACCEPTED"`, `"REJECTED"`, `"PENDING"`, `"AWAITING_HOST"` | `apps/api/v2/src/platform/bookings/2024-04-15/outputs/get-bookings.output.ts:19-27` |
+| **API v2 2024-08-13** | 硬编码数组（小写） | `"cancelled"`, `"accepted"`, `"rejected"`, `"pending"`（**缺少 awaiting_host**） | `packages/platform/types/bookings/2024-08-13/outputs/booking.output.ts:158-161` |
+
+---
+
+### 6A.11 关键风险点
+
+#### 风险 1：API v2 2024-08-13 AWAITING_HOST 缺失
+
+**问题**:
+```typescript
+// packages/platform/types/bookings/2024-08-13/outputs/booking.output.ts:158-161
+@IsEnum(["cancelled", "accepted", "rejected", "pending"])  // ❌ 无 "awaiting_host"
+status!: "cancelled" | "accepted" | "rejected" | "pending";
+```
+
+**影响**:
+- 即时会议创建的预约状态为 `AWAITING_HOST`（数据库 `'awaiting_host'`）
+- 使用 API v2 2024-08-13 时：
+  - 验证可能失败
+  - 或被错误映射为其他状态
+  - 前端无法正确显示即时会议状态
+
+#### 风险 2：Kysely CASE 表达式不同步
+
+**问题**:
+```typescript
+// 每次新增状态都需要手动添加
+.when("Booking.status", "=", "new_status")
+.then(BookingStatus.NEW_STATUS)
+```
+
+**风险**: 遗漏会导致 `.else(BookingStatus.PENDING)` 静默降级
+
+#### 风险 3：API 版本间大小写不兼容
+
+**问题**: 2024-04-15（大写）→ 2024-08-13（小写）
+
+**影响**: 客户端字符串比较逻辑需要修改
+
 ## 7. 逐跳证据链：EventType.length 字段
 
 **目的**：展示 `EventType.length` 字段从 schema 到业务消费的完整可核对路径
